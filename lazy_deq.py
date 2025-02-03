@@ -12,8 +12,8 @@ from transformers.utils import ContextManagers
 from transformers.utils.logging import get_logger
 
 # Import GGUF utilities (assumed available)
-from gguf import MODEL_ARCH_NAMES, get_tensor_name_map, GGUFReader  # , dequantize
-from gguf.quant_new import dequantize
+from gguf import MODEL_ARCH_NAMES, get_tensor_name_map, GGUFReader
+from gguf_gpu import dequantize
 
 torch.manual_seed(0)
 logger = get_logger(__name__)
