@@ -28,7 +28,14 @@ This script demonstrates:
 - Pipelining: Manages asynchronous offloading to optimize memory and compute resources.
 
 ## Benchmark
-Full GPU inference: 0.030s (2348 MiB)
-gguf_offload: 0.075s (1086 MiB)
+- Full GPU inference: 0.030s (2348 MiB)
+- gguf_offload: 0.075s (1086 MiB)
+- sequential offload using `accelerate`: 0.293s
+
+## Potential bugs
+Surge GPU memory usage
+
+## TODO
+Support MoE models like DeepSeek V3
 
 Happy Inference!
