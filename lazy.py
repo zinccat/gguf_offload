@@ -75,7 +75,7 @@ def lazy_load_hook(module, inputs):
                 raise ValueError(f"GGUF mapping does not contain key: {hf_key}")
             gguf_tensor = GLOBAL_GGUF_MAPPING[hf_key]
             deq_weights = dequantize(gguf_tensor.data, gguf_tensor.tensor_type)
-            param_tensor = torch.from_numpy(np.copy(deq_weights))
+            param_tensor = torch.from_numpy(deq_weights)
             # Use the device determined above.
             setattr(module, attr, param_tensor.to(device))
 
@@ -95,10 +95,16 @@ def get_module_by_name(model: nn.Module, full_param_name: str) -> nn.Module:
 
 def remove_registered_parameters(model: nn.Module):
     """
-    Remove all parameters from the model so that they are loaded on demand.
-    (This function removes every parameter; you could choose to keep some parameters loaded.)
+    Remove parameters from the model to enable lazy loading,
+    except for the specified modules that we want to keep loaded (embed_tokens, rotary_emb, norm).
     """
+    # Specify the top-level modules to keep (do not remove their parameters)
+    skip_modules = {"embed_tokens", "rotary_emb", "norm"}
     for full_name, param in list(model.named_parameters()):
+        # full_name looks like "embed_tokens.weight", "rotary_emb.some_attr", etc.
+        if full_name.split(".")[0] in skip_modules:
+            # Skip these so their parameters remain intact.
+            continue
         module = get_module_by_name(model, full_name)
         attr = full_name.split(".")[-1]
         if not hasattr(module, "lazy_params"):
@@ -206,12 +212,12 @@ def pipelined_inference_layers(layers, x, chunk_size=4, **kwargs):
         with torch.cuda.stream(cleanup_stream):
             cleanup_stream.wait_event(compute_done_events[i])
             gpu_chunks[i] = None  # Release GPU copy.
-    comp_stream.wait_event(compute_done_events[-1])
-    with torch.cuda.stream(comp_stream):
-        y = y.to("cpu", non_blocking=True)
+
     comp_stream.synchronize()
     load_stream.synchronize()
     cleanup_stream.synchronize()
+
+    torch.cuda.empty_cache()
 
     return y
 
@@ -243,17 +249,47 @@ if __name__ == "__main__":
     with ContextManagers(init_contexts):
         model = Qwen2Model(config)
 
-    # Remove every parameter from the model so that they are lazy-loaded.
+    # Remove parameters for lazy loading, except for embed_tokens, rotary_emb, and norm.
     remove_registered_parameters(model)
 
-    # Attach lazy loading/offloading hooks.
+    # Attach lazy loading/offloading hooks for modules that have lazy_params.
     for module in model.modules():
         if hasattr(module, "lazy_params"):
             module.register_forward_pre_hook(lazy_load_hook)
             module.register_forward_hook(lazy_offload_hook)
 
+    # Set the model to eval mode.
     model.eval()
+
+    def load_eager_module_weights(module: nn.Module, full_prefix: str, device="cuda"):
+        """
+        Eagerly load weights for a module whose parameters are still meta.
+        full_prefix should be the prefix used in the GGUF mapping (e.g., "model.rotary_emb").
+        This function iterates over the module's immediate parameters and loads their weight data.
+        """
+        # Iterate only over immediate parameters (not recursing into submodules)
+        for name, param in module.named_parameters(recurse=False):
+            # Construct the key expected in the GLOBAL_GGUF_MAPPING.
+            # The key is usually "full_prefix.<param_name>".
+            key = f"{full_prefix}.{name}"
+            if key not in GLOBAL_GGUF_MAPPING:
+                raise ValueError(f"GGUF mapping does not contain key: {key}")
+            gguf_tensor = GLOBAL_GGUF_MAPPING[key]
+            # dequantize returns a numpy array; copy it into a torch tensor.
+            deq_weights = dequantize(gguf_tensor.data, gguf_tensor.tensor_type)
+            loaded_tensor = torch.from_numpy(deq_weights).to(device)
+            # Replace the parameter with the loaded tensor wrapped in a Parameter.
+            module.register_parameter(name, nn.Parameter(loaded_tensor))
+
+    # For modules we want permanently on GPU:
+    load_eager_module_weights(model.embed_tokens, "embed_tokens")
+    load_eager_module_weights(model.rotary_emb, "rotary_emb")
+    load_eager_module_weights(model.norm, "norm")
+
+    # Explicitly move the modules we want to remain on GPU.
+    model.embed_tokens.to("cuda")
     model.rotary_emb.to("cuda")
+    model.norm.to("cuda")
 
     # --- Inference Example ---
     with torch.no_grad():
@@ -280,7 +316,7 @@ if __name__ == "__main__":
             "position_embeddings": position_embeddings,
         }
         # Process only the decoder layers using pipelined inference.
-        x = pipelined_inference_layers(model.layers, x, chunk_size=2, **extra_kwargs)
+        x = pipelined_inference_layers(model.layers, x, chunk_size=4, **extra_kwargs)
         # Final layer normalization.
         x = model.norm(x)
         print("Final output:", x[0, 0, :5])
@@ -307,7 +343,7 @@ if __name__ == "__main__":
                 "position_embeddings": position_embeddings,
             }
             x = pipelined_inference_layers(
-                model.layers, x, chunk_size=2, **extra_kwargs
+                model.layers, x, chunk_size=4, **extra_kwargs
             )
             x = model.norm(x)
     torch.cuda.synchronize()
