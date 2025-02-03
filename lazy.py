@@ -124,36 +124,10 @@ def clone_module(module, memo=None):
         return module
     clone = module.__new__(type(module))
     clone.__dict__ = module.__dict__.copy()
-    clone._parameters = module._parameters.copy()
-    clone._buffers = module._buffers.copy()
-    clone._modules = module._modules.copy()
-    if hasattr(clone, "_parameters"):
-        for param_key, param in module._parameters.items():
-            if param is not None:
-                param_ptr = param.data_ptr()
-                if param_ptr in memo:
-                    clone._parameters[param_key] = memo[param_ptr]
-                else:
-                    cloned = param.clone()
-                    if cloned.requires_grad:
-                        cloned.retain_grad()
-                    clone._parameters[param_key] = cloned
-                    memo[param_ptr] = cloned
-    if hasattr(clone, "_buffers"):
-        for buffer_key, buff in module._buffers.items():
-            if buff is not None and buff.requires_grad:
-                buff_ptr = buff.data_ptr()
-                if buff_ptr in memo:
-                    clone._buffers[buffer_key] = memo[buff_ptr]
-                else:
-                    cloned = buff.clone()
-                    if cloned.requires_grad:
-                        cloned.retain_grad()
-                    clone._buffers[buffer_key] = cloned
-                    memo[buff_ptr] = cloned
-    if hasattr(clone, "_modules"):
-        for mod_key in clone._modules:
-            clone._modules[mod_key] = clone_module(module._modules[mod_key], memo=memo)
+    # Explicitly copy lazy_params if it exists.
+    # if hasattr(module, "lazy_params"):
+    #     # Make a shallow copy (or deep copy if necessary)
+    #     clone.lazy_params = module.lazy_params.copy()
     return clone
 
 
