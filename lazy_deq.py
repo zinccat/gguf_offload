@@ -1,5 +1,5 @@
 """
-Running dequantization lazily during inference with GGUF using CPU.
+Running dequantization lazily during inference with GGUF using GPU.
 """
 
 import re
@@ -12,14 +12,17 @@ from transformers.utils import ContextManagers
 from transformers.utils.logging import get_logger
 
 # Import GGUF utilities (assumed available)
-from gguf import MODEL_ARCH_NAMES, get_tensor_name_map, GGUFReader, dequantize
+from gguf import MODEL_ARCH_NAMES, get_tensor_name_map, GGUFReader  # , dequantize
+from gguf.quant_new import dequantize
 
 torch.manual_seed(0)
 logger = get_logger(__name__)
 
+torch.set_grad_enabled(False)  # Not training, so no grad needed
+torch.backends.cudnn.benchmark = True  # Potential speed-up for conv-like ops
+
+
 # --- Lazy Loading Utilities (unchanged except for use in meta tensors) ---
-
-
 def get_gguf_hf_weights_map(hf_model, model_type=None, num_layers=None, qual_name=""):
     model_type = hf_model.config.model_type if model_type is None else model_type
     num_layers = hf_model.config.num_hidden_layers if num_layers is None else num_layers
@@ -70,8 +73,7 @@ def lazy_load_hook(module, inputs):
             if hf_key not in GLOBAL_GGUF_MAPPING:
                 raise ValueError(f"GGUF mapping does not contain key: {hf_key}")
             gguf_tensor = GLOBAL_GGUF_MAPPING[hf_key]
-            deq_weights = dequantize(gguf_tensor.data, gguf_tensor.tensor_type)
-            param_tensor = torch.from_numpy(deq_weights)
+            param_tensor = dequantize(gguf_tensor.data, gguf_tensor.tensor_type)
             # Use the device determined above.
             setattr(module, attr, param_tensor.to(device))
 
@@ -272,8 +274,7 @@ if __name__ == "__main__":
                 raise ValueError(f"GGUF mapping does not contain key: {key}")
             gguf_tensor = GLOBAL_GGUF_MAPPING[key]
             # dequantize returns a numpy array; copy it into a torch tensor.
-            deq_weights = dequantize(gguf_tensor.data, gguf_tensor.tensor_type)
-            loaded_tensor = torch.from_numpy(deq_weights).to(device)
+            loaded_tensor = dequantize(gguf_tensor.data, gguf_tensor.tensor_type)
             # Replace the parameter with the loaded tensor wrapped in a Parameter.
             module.register_parameter(name, nn.Parameter(loaded_tensor))
 
