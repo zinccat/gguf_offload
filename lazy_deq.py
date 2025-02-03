@@ -1,5 +1,7 @@
 """
 Running dequantization lazily during inference with GGUF using GPU.
+
+Partly adapted from https://github.com/99991/pygguf and Transformers
 """
 
 import re
