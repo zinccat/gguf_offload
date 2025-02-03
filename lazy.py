@@ -4,7 +4,7 @@ with lazy per-layer dequantization/loading of weights for the Qwen model.
 """
 
 import re
-from typing import NamedTuple, Optional
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -12,11 +12,6 @@ import numpy as np
 
 from transformers.utils import ContextManagers
 from transformers.utils.logging import get_logger
-from transformers.integrations import (
-    GGUF_CONFIG_MAPPING,
-    GGUF_TOKENIZER_MAPPING,
-    _gguf_parse_value,
-)
 from transformers import PretrainedConfig, Qwen2Model
 from transformers.modeling_utils import no_init_weights, init_empty_weights
 
@@ -25,51 +20,6 @@ from gguf import MODEL_ARCH_NAMES, get_tensor_name_map, GGUFReader, dequantize
 # Set random seed for reproducibility
 torch.manual_seed(0)
 logger = get_logger(__name__)
-
-# === GGUF and Tensor Processing Setup ===
-
-GGUF_TO_TRANSFORMERS_MAPPING = {
-    "ignore": {
-        "GGUF": {
-            "version": "version",
-            "tensor_count": "tensor_count",
-            "kv_count": "kv_count",
-        },
-        "general": {
-            "file_type": "file_type",
-            "quantization_version": "quantization_version",
-        },
-    },
-    "config": GGUF_CONFIG_MAPPING,
-    "tokenizer": {"tokenizer": GGUF_TOKENIZER_MAPPING["tokenizer"]},
-    "tokenizer_config": {"tokenizer": GGUF_TOKENIZER_MAPPING["tokenizer_config"]},
-}
-
-GGUF_SUPPORTED_ARCHITECTURES = list(GGUF_TO_TRANSFORMERS_MAPPING["config"].keys())
-
-
-class GGUFTensor(NamedTuple):
-    weights: np.ndarray
-    name: str
-    metadata: dict
-
-
-class TensorProcessor:
-    def __init__(self, config=None):
-        self.config = config or {}
-
-    def process(self, weights, name, **kwargs):
-        return GGUFTensor(weights, name, {})
-
-TENSOR_PROCESSORS = {}
-
-def read_field(reader, field):
-    value = reader.fields[field]
-    return [
-        _gguf_parse_value(value.parts[_data_index], value.types)
-        for _data_index in value.data
-    ]
-
 
 def get_gguf_hf_weights_map(
     hf_model,
