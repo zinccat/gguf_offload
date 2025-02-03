@@ -1,35 +1,30 @@
 """
-Adapted from https://github.com/99991/pygguf and Transformers,
-with lazy per-layer dequantization/loading of weights for the Qwen model.
+Example: Using the original Qwen2Model with modified chunk/pipelined inference logic.
+All parameters are lazy-loaded from a GGUF checkpoint. The pipelined code now accepts
+extra keyword arguments (e.g. position_ids, cache_position, position_embeddings, etc.)
+and passes them to each decoder layer so that the original forward logic is respected.
 """
 
 import re
-from typing import Optional
-
 import torch
 import torch.nn as nn
 import numpy as np
 
-from transformers.utils import ContextManagers
-from transformers.utils.logging import get_logger
 from transformers import PretrainedConfig, Qwen2Model
 from transformers.modeling_utils import no_init_weights, init_empty_weights
+from transformers.utils import ContextManagers
+from transformers.utils.logging import get_logger
 
+# Import GGUF utilities (assumed available)
 from gguf import MODEL_ARCH_NAMES, get_tensor_name_map, GGUFReader, dequantize
 
-# Set random seed for reproducibility
 torch.manual_seed(0)
 logger = get_logger(__name__)
 
-def get_gguf_hf_weights_map(
-    hf_model,
-    model_type: Optional[str] = None,
-    num_layers: Optional[int] = None,
-    qual_name: str = "",
-):
-    """
-    Creates a mapping from GGUF tensor names to HF parameter names.
-    """
+# --- Lazy Loading Utilities (unchanged except for use in meta tensors) ---
+
+
+def get_gguf_hf_weights_map(hf_model, model_type=None, num_layers=None, qual_name=""):
     model_type = hf_model.config.model_type if model_type is None else model_type
     num_layers = hf_model.config.num_hidden_layers if num_layers is None else num_layers
     if model_type == "cohere":
@@ -47,14 +42,13 @@ def get_gguf_hf_weights_map(
     gguf_to_hf_name_map = {}
     state_dict = hf_model.state_dict()
     for hf_name in state_dict.keys():
-        # For qwen2moe, normalize expert names.
         if model_type == "qwen2moe" and "mlp.experts." in hf_name:
             hf_name = re.sub(r"mlp.experts.\d+.", "mlp.experts.", hf_name)
         name, suffix = hf_name, ""
         if hf_name.endswith(".weight") or hf_name.endswith(".bias"):
             name, suffix = hf_name.rsplit(".", 1)
             suffix = "." + suffix
-        name = "model." + name  # essential for the name_map.get_name to work
+        name = "model." + name  # required for name map lookup
         gguf_name = name_map.get_name(name)
         if gguf_name is None:
             continue
@@ -62,43 +56,36 @@ def get_gguf_hf_weights_map(
     return gguf_to_hf_name_map
 
 
-# === Lazy-Loading / Offloading Setup for Individual Layers ===
-
-# Instead of dequantizing all weights at once,
-# we build a global mapping from each HF parameter name to its corresponding GGUF tensor object.
 GLOBAL_GGUF_READER = None
 GLOBAL_GGUF_MAPPING = {}
 
 
 def lazy_load_hook(module, inputs):
-    """
-    Pre-forward hook:
-    For each lazy parameter in the module, look up its GGUF tensor,
-    dequantize it on demand, and move it to the device of the input.
-    """
+    # Determine the device from the input tensor.
+    input0 = inputs[0]
+    if isinstance(input0, tuple) or isinstance(input0, list):
+        # If the first input is a tuple/list, take its first element.
+        input0 = input0[0]
+    device = input0.device
+
     for attr, hf_key in getattr(module, "lazy_params", {}).items():
-        if getattr(module, attr) is None:
+        param = getattr(module, attr)
+        if param is None or (hasattr(param, "device") and param.device.type == "meta"):
             if hf_key not in GLOBAL_GGUF_MAPPING:
                 raise ValueError(f"GGUF mapping does not contain key: {hf_key}")
             gguf_tensor = GLOBAL_GGUF_MAPPING[hf_key]
-            # Dequantize the weight individually on demand.
             deq_weights = dequantize(gguf_tensor.data, gguf_tensor.tensor_type)
-            # Convert to torch tensor.
             param_tensor = torch.from_numpy(np.copy(deq_weights))
-            setattr(module, attr, param_tensor.to(inputs[0].device))
+            # Use the device determined above.
+            setattr(module, attr, param_tensor.to(device))
 
 
 def lazy_offload_hook(module, inputs, output):
-    """
-    Post-forward hook:
-    After computation, offload the parameter by setting it back to None.
-    """
     for attr in getattr(module, "lazy_params", {}):
         setattr(module, attr, None)
 
 
 def get_module_by_name(model: nn.Module, full_param_name: str) -> nn.Module:
-    """Return the parent module that holds the parameter given its full name."""
     parts = full_param_name.split(".")
     mod = model
     for part in parts[:-1]:
@@ -108,39 +95,168 @@ def get_module_by_name(model: nn.Module, full_param_name: str) -> nn.Module:
 
 def remove_registered_parameters(model: nn.Module):
     """
-    For every registered parameter in the model, remove it from the module
-    (so it does not occupy memory) and record its full key in a new attribute `lazy_params`.
+    Remove all parameters from the model so that they are loaded on demand.
+    (This function removes every parameter; you could choose to keep some parameters loaded.)
     """
     for full_name, param in list(model.named_parameters()):
         module = get_module_by_name(model, full_name)
         attr = full_name.split(".")[-1]
         if not hasattr(module, "lazy_params"):
             module.lazy_params = {}
-        # Record the mapping from attribute (e.g. 'weight') to the full parameter name (HF key)
         module.lazy_params[attr] = full_name
-        # Remove the parameter from the module’s _parameters and set attribute to None.
         if attr in module._parameters:
             del module._parameters[attr]
         setattr(module, attr, None)
 
 
-# === Main Loading and Model Setup ===
+# --- Pipelined Inference Utilities for Decoder Layers ---
+def chunked_layers(layers, chunk_size=4):
+    layers_list = list(layers)
+    return [
+        layers_list[i : i + chunk_size] for i in range(0, len(layers_list), chunk_size)
+    ]
+
+
+def clone_module(module, memo=None):
+    if memo is None:
+        memo = {}
+    if not isinstance(module, nn.Module):
+        return module
+    clone = module.__new__(type(module))
+    clone.__dict__ = module.__dict__.copy()
+    clone._parameters = module._parameters.copy()
+    clone._buffers = module._buffers.copy()
+    clone._modules = module._modules.copy()
+    if hasattr(clone, "_parameters"):
+        for param_key, param in module._parameters.items():
+            if param is not None:
+                param_ptr = param.data_ptr()
+                if param_ptr in memo:
+                    clone._parameters[param_key] = memo[param_ptr]
+                else:
+                    cloned = param.clone()
+                    if cloned.requires_grad:
+                        cloned.retain_grad()
+                    clone._parameters[param_key] = cloned
+                    memo[param_ptr] = cloned
+    if hasattr(clone, "_buffers"):
+        for buffer_key, buff in module._buffers.items():
+            if buff is not None and buff.requires_grad:
+                buff_ptr = buff.data_ptr()
+                if buff_ptr in memo:
+                    clone._buffers[buffer_key] = memo[buff_ptr]
+                else:
+                    cloned = buff.clone()
+                    if cloned.requires_grad:
+                        cloned.retain_grad()
+                    clone._buffers[buffer_key] = cloned
+                    memo[buff_ptr] = cloned
+    if hasattr(clone, "_modules"):
+        for mod_key in clone._modules:
+            clone._modules[mod_key] = clone_module(module._modules[mod_key], memo=memo)
+    return clone
+
+
+def copy_layers_to_device(layers, device, non_blocking=True):
+    new_layers = []
+    for layer in layers:
+        new_layer = clone_module(layer)
+        if hasattr(new_layer, "lazy_params"):
+            new_layer.register_forward_pre_hook(lazy_load_hook)
+            new_layer.register_forward_hook(lazy_offload_hook)
+        new_layers.append(new_layer.to(device, non_blocking=non_blocking))
+    return new_layers
+
+
+def run_chunk(chunk, x, **kwargs):
+    """
+    Run a forward pass through a chunk (list) of layers.
+    All extra keyword arguments (such as attention_mask, position_ids,
+    past_key_value, cache_position, position_embeddings, etc.) are forwarded.
+    """
+    with torch.no_grad():
+        for layer in chunk:
+            x = layer(x, **kwargs)[0]
+    return x
+
+
+def pipelined_inference_layers(layers, x, chunk_size=4, **kwargs):
+    """
+    Runs pipelined inference on a list of layers.
+    Splits layers into chunks, clones each chunk to GPU,
+    and processes them in a pipelined fashion while forwarding extra keyword arguments.
+    """
+    if not torch.cuda.is_available():
+        with torch.no_grad():
+            for layer in layers:
+                x = layer(x, **kwargs)
+        return x
+
+    device = torch.device("cuda")
+    net_chunks = chunked_layers(layers, chunk_size)
+    num_chunks = len(net_chunks)
+
+    load_stream = torch.cuda.Stream()
+    comp_stream = torch.cuda.Stream()
+    cleanup_stream = torch.cuda.Stream()
+
+    compute_done_events = [
+        torch.cuda.Event(enable_timing=False) for _ in range(num_chunks)
+    ]
+    load_done_events = [None] * num_chunks
+    gpu_chunks = [None] * num_chunks
+
+    # 1) Move input to GPU.
+    with torch.cuda.stream(comp_stream):
+        y = x.to(device, non_blocking=True)
+
+    # 2) Pre-load the first chunk.
+    with torch.cuda.stream(load_stream):
+        gpu_chunks[0] = copy_layers_to_device(net_chunks[0], device, non_blocking=True)
+        load_done_events[0] = torch.cuda.Event(enable_timing=False)
+        load_done_events[0].record(load_stream)
+
+    # 3) Process chunks in a pipelined fashion.
+    for i in range(num_chunks):
+        comp_stream.wait_event(load_done_events[i])
+        with torch.cuda.stream(comp_stream):
+            y = run_chunk(gpu_chunks[i], y, **kwargs)
+            compute_done_events[i].record(comp_stream)
+        if i + 1 < num_chunks:
+            with torch.cuda.stream(load_stream):
+                gpu_chunks[i + 1] = copy_layers_to_device(
+                    net_chunks[i + 1], device, non_blocking=True
+                )
+                load_done_events[i + 1] = torch.cuda.Event(enable_timing=False)
+                load_done_events[i + 1].record(load_stream)
+        with torch.cuda.stream(cleanup_stream):
+            cleanup_stream.wait_event(compute_done_events[i])
+            gpu_chunks[i] = None  # Release GPU copy.
+    comp_stream.wait_event(compute_done_events[-1])
+    with torch.cuda.stream(comp_stream):
+        y = y.to("cpu", non_blocking=True)
+    comp_stream.synchronize()
+    load_stream.synchronize()
+    cleanup_stream.synchronize()
+
+    return y
+
+
+# --- Main Model Loading and Inference ---
 
 if __name__ == "__main__":
-    # Specify the pretrained model name/path and GGUF checkpoint.
+    # Specify pretrained model and GGUF checkpoint.
     pretrained_model_name_or_path = "Qwen/Qwen2.5-Coder-0.5B"
     config = PretrainedConfig.from_pretrained(pretrained_model_name_or_path)
     gguf_path = "models/qwen2.5-coder-0.5b-instruct-q4_0.gguf"
 
-    # Create a dummy model on the 'meta' device to build the tensor mapping.
+    # Create a dummy model on "meta" to build the tensor mapping.
     with torch.device("meta"):
         dummy_model = Qwen2Model(config)
-    # Build the mapping from GGUF tensor names to HF parameter names.
     tensor_key_mapping = get_gguf_hf_weights_map(dummy_model)
 
-    # Initialize the GGUF reader (this loads only metadata and tensor pointers).
+    # Initialize the GGUF reader (loads metadata and tensor pointers).
     GLOBAL_GGUF_READER = GGUFReader(gguf_path)
-    # Build GLOBAL_GGUF_MAPPING: map each HF parameter name to its corresponding GGUF tensor.
     for tensor in GLOBAL_GGUF_READER.tensors:
         name = tensor.name
         if name not in tensor_key_mapping:
@@ -148,42 +264,78 @@ if __name__ == "__main__":
         hf_key = tensor_key_mapping[name]
         GLOBAL_GGUF_MAPPING[hf_key] = tensor
 
-    # Initialize the actual model on empty weights.
-    _fast_init = True
-    init_contexts = [no_init_weights(_enable=_fast_init), init_empty_weights()]
+    # Initialize the actual model with empty weights.
+    init_contexts = [no_init_weights(_enable=True), init_empty_weights()]
     with ContextManagers(init_contexts):
         model = Qwen2Model(config)
 
-    # Remove registered parameters so that each layer will load its weight on demand.
+    # Remove every parameter from the model so that they are lazy-loaded.
     remove_registered_parameters(model)
 
-    # Attach the lazy loading/offloading hooks to every module that has lazy parameters.
+    # Attach lazy loading/offloading hooks.
     for module in model.modules():
         if hasattr(module, "lazy_params"):
             module.register_forward_pre_hook(lazy_load_hook)
             module.register_forward_hook(lazy_offload_hook)
 
     model.eval()
-
-    with torch.no_grad():
-        # Adjust input dimensions as required by your model; here we use 512 tokens as an example.
-        input_ids = torch.randint(0, 151936, (1, 512))
-        output = model(input_ids)
-        print("Model output:", output)
-
-    from timeit import default_timer as timer
-
     model.rotary_emb.to("cuda")
 
-    start = timer()
-
-    # Run a forward pass.
-    # Each layer will dequantize its weight individually on demand, perform computation, then offload.
+    # --- Inference Example ---
     with torch.no_grad():
-        for i in range(10):
-            # Adjust input dimensions as required by your model; here we use 512 tokens as an example.
-            input_ids = torch.randint(0, 151936, (1, 512)).cuda()
-            output = model(input_ids)
+        # Create dummy input.
+        input_ids = torch.randint(0, 151936, (1, 512)).cuda()
+        # Compute embeddings.
+        x = model.embed_tokens(input_ids)
+        # Compute additional arguments required by the original forward:
+        # For this example, we assume no past key values.
+        past_key_values = None
+        cache_position = torch.arange(0, x.shape[1], device=x.device)
+        position_ids = cache_position.unsqueeze(0)
+        # Compute position embeddings using the model's rotary_emb.
+        position_embeddings = model.rotary_emb(x, position_ids)
+        # (Optionally, compute a causal mask if required.)
+        # Here we pass attention_mask=None for simplicity.
+        extra_kwargs = {
+            "attention_mask": None,
+            "position_ids": position_ids,
+            "past_key_value": past_key_values,
+            "output_attentions": False,
+            "use_cache": False,
+            "cache_position": cache_position,
+            "position_embeddings": position_embeddings,
+        }
+        # Process only the decoder layers using pipelined inference.
+        x = pipelined_inference_layers(model.layers, x, chunk_size=2, **extra_kwargs)
+        # Final layer normalization.
+        x = model.norm(x)
+        print("Final output:", x[0, 0, :5])
 
+    # --- Optional Performance Timing ---
+    from timeit import default_timer as timer
+
+    start = timer()
+    with torch.no_grad():
+        for _ in range(10):
+            input_ids = torch.randint(0, 151936, (1, 512)).cuda()
+            x = model.embed_tokens(input_ids)
+            # Recompute extra arguments per forward pass.
+            cache_position = torch.arange(0, x.shape[1], device=x.device)
+            position_ids = cache_position.unsqueeze(0)
+            position_embeddings = model.rotary_emb(x, position_ids)
+            extra_kwargs = {
+                "attention_mask": None,
+                "position_ids": position_ids,
+                "past_key_value": None,
+                "output_attentions": False,
+                "use_cache": False,
+                "cache_position": cache_position,
+                "position_embeddings": position_embeddings,
+            }
+            x = pipelined_inference_layers(
+                model.layers, x, chunk_size=2, **extra_kwargs
+            )
+            x = model.norm(x)
+    torch.cuda.synchronize()
     end = timer()
-    print("Time taken:", (end - start) / 10)
+    print("Average time per inference:", (end - start) / 10)
