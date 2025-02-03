@@ -28,14 +28,20 @@ This script demonstrates:
 - Pipelining: Manages asynchronous offloading to optimize memory and compute resources.
 
 ## Benchmark
+Using batchsize=1, seq_len=512, prefilling
+
+For Qwen-0.5B
 - Full GPU inference: 0.030s (2348 MiB)
 - gguf_offload: 0.075s (1086 MiB)
 - sequential offload using `accelerate`: 0.293s
+
+For DeepSeek-R1 671B 1.58bit quantization
+- gguf_offload: ~10s (7836 MiB)
 
 ## Potential bugs
 Surge GPU memory usage
 
 ## TODO
-Support MoE models like DeepSeek V3
+Support end to end generation
 
 Happy Inference!
