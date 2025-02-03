@@ -348,3 +348,4 @@ if __name__ == "__main__":
     torch.cuda.synchronize()
     end = timer()
     print("Average time per inference:", (end - start) / 10)
+    

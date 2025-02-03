@@ -3,7 +3,7 @@ Adapted from https://github.com/99991/pygguf and Transformers
 """
 
 import re
-from typing import Dict, NamedTuple, Optional
+from typing import NamedTuple, Optional
 
 import torch
 import numpy as np
@@ -60,54 +60,7 @@ class TensorProcessor:
         return GGUFTensor(weights, name, {})
 
 
-class Qwen2MoeTensorProcessor(TensorProcessor):
-    def __init__(self, config=None):
-        super().__init__(config=config)
-
-    def process(self, weights, name, **kwargs):
-        if "_exp" in name:
-            tensor_key_mapping = kwargs.get("tensor_key_mapping")
-            parsed_parameters = kwargs.get("parsed_parameters")
-            if tensor_key_mapping:
-                self._split_moe_expert_tensor(
-                    weights, parsed_parameters, name, tensor_key_mapping
-                )
-                return GGUFTensor(weights, None, {})
-        if "ffn_gate_inp_shexp" in name:
-            # for compatibility tensor shared_expert_gate must be (1, 2048) dim,
-            # quantized one is (2048)
-            weights = np.expand_dims(weights, axis=0)
-        return GGUFTensor(weights, name, {})
-
-    def _split_moe_expert_tensor(
-        self,
-        weights: np.ndarray,
-        parsed_parameters: Dict[str, Dict],
-        name: str,
-        tensor_key_mapping: dict,
-    ):
-        # Original merge implementation
-        # https://github.com/ggerganov/llama.cpp/blob/master/convert_hf_to_gguf.py#L1994-L2022
-        name = tensor_key_mapping[name]
-        w_counter = self.config.get("num_experts", 60)
-        for i in range(0, w_counter):
-            temp_name = name.replace("mlp.experts.", f"mlp.experts.{i}.")
-            exp_weight = weights[i]
-            parsed_parameters["tensors"][temp_name] = torch.from_numpy(
-                np.copy(exp_weight)
-            )
-
-
-TENSOR_PROCESSORS = {
-    # "llama": LlamaTensorProcessor,
-    "qwen2moe": Qwen2MoeTensorProcessor,
-    # "bloom": BloomTensorProcessor,
-    # "t5": T5TensorProcessor,
-    # "t5encoder": T5TensorProcessor,
-    # "gpt2": GPT2TensorProcessor,
-    # "mamba": MambaTensorProcessor,
-    # "gemma2": Gemma2TensorProcessor,
-}
+TENSOR_PROCESSORS = {}
 
 
 def read_field(reader, field):
@@ -492,9 +445,7 @@ if __name__ == "__main__":
     config = PretrainedConfig.from_pretrained(pretrained_model_name_or_path)
 
     # Path to the GGUF checkpoint
-    gguf_path = (
-        "models/qwen2.5-coder-0.5b-instruct-q4_0.gguf"
-    )
+    gguf_path = "models/qwen2.5-coder-0.5b-instruct-q4_0.gguf"
 
     # Dummy model for loading state_dict
     with torch.device("meta"):
@@ -534,8 +485,23 @@ if __name__ == "__main__":
     print("Model:", model)
 
     model.eval()
+    model.to("cuda")
 
     # Run a forward pass
     with torch.no_grad():
         # Adjust input dimensions according to your model's requirements (512 tokens in this case)
-        print(model(torch.randint(0, 151936, (1, 512))))
+        print(model(torch.randint(0, 151936, (1, 512)).to("cuda")))
+
+    from timeit import default_timer as timer
+
+    start = timer()
+    with torch.no_grad():
+        for _ in range(10):
+            # Adjust input dimensions according to your model's requirements (512 tokens in this case)
+            out = model(torch.randint(0, 151936, (1, 512)).to("cuda"))
+    torch.cuda.synchronize()
+    end = timer()
+
+    torch.cuda.empty_cache()
+
+    print("Inference time:", (end - start) / 10)

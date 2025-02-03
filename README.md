@@ -27,4 +27,8 @@ This script demonstrates:
 - GPU Dequantization: Converts quantized weights on the GPU.
 - Pipelining: Manages asynchronous offloading to optimize memory and compute resources.
 
+## Benchmark
+Full GPU inference: 0.030s (2348 MiB)
+gguf_offload: 0.075s (1086 MiB)
+
 Happy Inference!
