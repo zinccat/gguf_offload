@@ -71,6 +71,13 @@ load_eager_module_weights(model.norm, "norm")
 model.embed_tokens.to("cuda")
 model.norm.to("cuda")
 
+load_eager_module_weights(model.layers[0], "layers.0")
+load_eager_module_weights(model.layers[1], "layers.1")
+load_eager_module_weights(model.layers[2], "layers.2")
+model.layers[0].to("cuda")
+model.layers[1].to("cuda")
+model.layers[2].to("cuda")
+
 # use lm_head tied to embed_tokens
 model.lm_head = torch.nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 model.lm_head.weight = model.embed_tokens.weight

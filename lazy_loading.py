@@ -78,6 +78,9 @@ def remove_registered_parameters(model):
     for full_name, _ in list(model.named_parameters()):
         if full_name.split(".")[0] in skip_modules:
             continue
+        if full_name.split(".")[0] == 'layers' and int(full_name.split(".")[1]) < 3:
+            # Skip the first 3 Dense layers
+            continue
         module = get_module_by_name(model, full_name)
         attr = full_name.split(".")[-1]
         if not hasattr(module, "lazy_params"):
@@ -88,10 +91,21 @@ def remove_registered_parameters(model):
         setattr(module, attr, None)
 
 def load_eager_module_weights(module, full_prefix, device="cuda"):
-    for name, _ in module.named_parameters(recurse=False):
-        key = f"{full_prefix}.{name}"
+    for full_name, _ in module.named_parameters(recurse=True):
+        key = f"{full_prefix}.{full_name}"
         if key not in GLOBAL_GGUF_MAPPING:
             raise ValueError(f"GGUF mapping does not contain key: {key}")
+        
         gguf_tensor = GLOBAL_GGUF_MAPPING[key]
-        loaded_tensor = dequantize(gguf_tensor.data, gguf_tensor.tensor_type)
-        module.register_parameter(name, torch.nn.Parameter(loaded_tensor))
+        loaded_tensor = dequantize(gguf_tensor.data, gguf_tensor.tensor_type).to(device)
+        
+        # Split the full_name into its components (e.g. "submodule.weight" -> ["submodule", "weight"])
+        name_parts = full_name.split(".")
+        # Traverse the module hierarchy to get to the correct submodule
+        submodule = module
+        for part in name_parts[:-1]:
+            submodule = getattr(submodule, part)
+        # The actual parameter name (without dots)
+        param_name = name_parts[-1]
+        # Replace (or register) the parameter in the found submodule
+        submodule.register_parameter(param_name, torch.nn.Parameter(loaded_tensor))
