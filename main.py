@@ -6,6 +6,7 @@ from transformers.modeling_utils import no_init_weights, init_empty_weights
 from transformers.utils import ContextManagers, logging
 from transformers.modeling_attn_mask_utils import _prepare_4d_causal_attention_mask
 from transformers.utils.import_utils import is_torch_fx_available
+from transformers.cache_utils import DynamicCache
 
 from deepseek.modeling_deepseek import DeepseekV3Model
 from gguf import GGUFReader
@@ -17,7 +18,7 @@ from lazy_loading import (
     GLOBAL_GGUF_MAPPING,
     GLOBAL_GGUF_READER,
     lazy_load_hook,
-    lazy_offload_hook
+    lazy_offload_hook,
 )
 from inference import pipelined_inference_layers
 
@@ -79,40 +80,56 @@ with torch.no_grad():
     x = model.embed_tokens(input_ids)
     cache_position = torch.arange(0, x.shape[1], device=x.device)
     position_ids = cache_position.unsqueeze(0)
-    attention_mask = _prepare_4d_causal_attention_mask(None, (batch_size, seq_length), x, 0)
-    extra_kwargs = {
-        "attention_mask": attention_mask,
-        "position_ids": position_ids,
-        "past_key_value": None,
-        "output_attentions": False,
-        "use_cache": False,
-        "cache_position": cache_position,
-    }
-    x = pipelined_inference_layers(model.layers, x, chunk_size=6, **extra_kwargs)
+    attention_mask = _prepare_4d_causal_attention_mask(
+        None, (batch_size, seq_length), x, 0
+    )
+    past_key_value = DynamicCache()
+    output_attentions = False
+    use_cache = True
+    x, cache = pipelined_inference_layers(
+        model.layers,
+        x,
+        chunk_size=6,
+        attention_mask=attention_mask,
+        position_ids=position_ids,
+        past_key_value=past_key_value,
+        output_attentions=output_attentions,
+        use_cache=use_cache,
+    )
     x = model.norm(x)
     x = model.lm_head(x)
+    print(len(cache.key_cache))
     print("Final output:", x[0, 0, :5])
 
 start = timer()
 with torch.no_grad():
     for i in range(5):
-        input_ids = torch.randint(0, 129280, (1, 512)).cuda()
+        batch_size, seq_length = 1, 512
+        input_ids = torch.randint(0, 129280, (batch_size, seq_length)).cuda()
         x = model.embed_tokens(input_ids)
         cache_position = torch.arange(0, x.shape[1], device=x.device)
         position_ids = cache_position.unsqueeze(0)
-        attention_mask = _prepare_4d_causal_attention_mask(None, (1, 512), x, 0)
-        extra_kwargs = {
-            "attention_mask": attention_mask,
-            "position_ids": position_ids,
-            "past_key_value": None,
-            "output_attentions": False,
-            "use_cache": False,
-            "cache_position": cache_position,
-        }
-        x = pipelined_inference_layers(model.layers, x, chunk_size=6, **extra_kwargs)
+        attention_mask = _prepare_4d_causal_attention_mask(
+            None, (batch_size, seq_length), x, 0
+        )
+        past_key_value = DynamicCache()
+        output_attentions = False
+        use_cache = True
+        x, cache = pipelined_inference_layers(
+            model.layers,
+            x,
+            chunk_size=6,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_value=past_key_value,
+            output_attentions=output_attentions,
+            use_cache=use_cache,
+        )
         x = model.norm(x)
         x = model.lm_head(x)
-        print(f"Finished {i + 1} inference, GPU memory: {torch.cuda.memory_allocated() / 1e9:.2f} GB, time: {timer() - start:.2f}")
+        print(
+            f"Finished {i + 1} inference, GPU memory: {torch.cuda.memory_allocated() / 1e9:.2f} GB, time: {timer() - start:.2f}"
+        )
 torch.cuda.synchronize()
 end = timer()
 print("Average time per inference:", (end - start) / 5)
