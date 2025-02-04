@@ -77,18 +77,26 @@ model.lm_head.to("cuda")
 with torch.no_grad():
     batch_size, seq_length = 1, 512
     input_ids = torch.randint(0, 129280, (batch_size, seq_length)).cuda()
-    x = model.embed_tokens(input_ids)
-    cache_position = torch.arange(0, x.shape[1], device=x.device)
-    position_ids = cache_position.unsqueeze(0)
+    inputs_embeds = model.embed_tokens(input_ids)
     attention_mask = _prepare_4d_causal_attention_mask(
-        None, (batch_size, seq_length), x, 0
+        None, (batch_size, seq_length), inputs_embeds, 0
     )
     past_key_value = DynamicCache()
     output_attentions = False
     use_cache = True
+    past_key_values_length = 0
+    if use_cache:
+        past_key_values_length = past_key_value.get_usable_length(seq_length)
+    position_ids = torch.arange(
+        past_key_values_length,
+        seq_length + past_key_values_length,
+        dtype=torch.long,
+        device="cuda",
+    )
+    position_ids = position_ids.unsqueeze(0)
     x, cache = pipelined_inference_layers(
         model.layers,
-        x,
+        inputs_embeds,
         chunk_size=6,
         attention_mask=attention_mask,
         position_ids=position_ids,
