@@ -27,6 +27,8 @@ torch.manual_seed(0)
 logger = logging.get_logger(__name__)
 torch.set_grad_enabled(False)
 torch.backends.cudnn.benchmark = True
+# use tf32
+torch.backends.cuda.matmul.allow_tf32 = True
 
 if is_torch_fx_available():
     _prepare_4d_causal_attention_mask = torch.fx.wrap(_prepare_4d_causal_attention_mask)
@@ -34,6 +36,7 @@ if is_torch_fx_available():
 # Load model configuration and create a dummy model (on "meta") for weight mapping.
 pretrained_model_name_or_path = "deepseek-ai/DeepSeek-R1"
 config = PretrainedConfig.from_pretrained(pretrained_model_name_or_path)
+# config._attn_implementation = "flash_attention_2"
 with torch.device("meta"):
     dummy_model = DeepseekV3Model(config)
 tensor_key_mapping = get_gguf_hf_weights_map(dummy_model)
@@ -75,39 +78,50 @@ model.lm_head.to("cuda")
 
 # --- Inference Example ---
 with torch.no_grad():
-    batch_size, seq_length = 1, 512
+    batch_size, seq_length = 1, 128
     input_ids = torch.randint(0, 129280, (batch_size, seq_length)).cuda()
-    inputs_embeds = model.embed_tokens(input_ids)
-    attention_mask = _prepare_4d_causal_attention_mask(
-        None, (batch_size, seq_length), inputs_embeds, 0
-    )
     past_key_value = DynamicCache()
     output_attentions = False
     use_cache = True
     past_key_values_length = 0
-    if use_cache:
-        past_key_values_length = past_key_value.get_usable_length(seq_length)
-    position_ids = torch.arange(
-        past_key_values_length,
-        seq_length + past_key_values_length,
-        dtype=torch.long,
-        device="cuda",
-    )
-    position_ids = position_ids.unsqueeze(0)
-    x, cache = pipelined_inference_layers(
-        model.layers,
-        inputs_embeds,
-        chunk_size=6,
-        attention_mask=attention_mask,
-        position_ids=position_ids,
-        past_key_value=past_key_value,
-        output_attentions=output_attentions,
-        use_cache=use_cache,
-    )
-    x = model.norm(x)
-    x = model.lm_head(x)
-    print(len(cache.key_cache))
-    print("Final output:", x[0, 0, :5])
+    start = timer()
+    for i in range(10):
+        inputs_embeds = model.embed_tokens(input_ids)
+        if use_cache:
+            past_key_values_length = past_key_value.get_usable_length(seq_length)
+        attention_mask = _prepare_4d_causal_attention_mask(
+            None, (batch_size, seq_length), inputs_embeds, past_key_values_length
+        )
+        if attention_mask is None:
+            attention_mask = torch.ones(
+                (batch_size, 1, seq_length, seq_length + past_key_values_length),
+                device=inputs_embeds.device,
+            )
+        position_ids = torch.arange(
+            past_key_values_length,
+            seq_length + past_key_values_length,
+            dtype=torch.long,
+            device="cuda",
+        )
+        position_ids = position_ids.unsqueeze(0)
+        x, past_key_value = pipelined_inference_layers(
+            model.layers,
+            inputs_embeds,
+            chunk_size=2,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_value=past_key_value,
+            output_attentions=output_attentions,
+            use_cache=use_cache,
+        )
+        x = model.norm(x)
+        logits = model.lm_head(x)
+        last_token_logits = logits[:, -1, :]
+        print("Final output:", logits[0, 0, :5])
+        input_ids = torch.argmax(last_token_logits, dim=-1, keepdim=True)
+        seq_length = 1  # new token
+        print(timer() - start)
+        start = timer()
 
 start = timer()
 with torch.no_grad():
