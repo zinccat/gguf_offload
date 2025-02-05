@@ -36,7 +36,7 @@ For Qwen-0.5B
 - sequential offload using `accelerate`: 0.293s
 
 For DeepSeek-R1 671B 1.58bit quantization
-- gguf_offload: ~10s (7836 MiB)
+- gguf_offload: ~50s prefill, ~3s decode
 
 ## Potential bugs
 Surge GPU memory usage
