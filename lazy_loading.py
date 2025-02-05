@@ -7,6 +7,7 @@ from gguf_gpu import dequantize
 GLOBAL_GGUF_MAPPING = {}
 GLOBAL_GGUF_READER = None
 
+
 def get_gguf_hf_weights_map(hf_model, model_type=None, num_layers=None, qual_name=""):
     model_type = hf_model.config.model_type if model_type is None else model_type
     num_layers = hf_model.config.num_hidden_layers if num_layers is None else num_layers
@@ -27,8 +28,12 @@ def get_gguf_hf_weights_map(hf_model, model_type=None, num_layers=None, qual_nam
     gguf_to_hf_name_map = {}
     state_dict = hf_model.state_dict()
     for hf_name in state_dict.keys():
-        if model_type == "qwen2moe" and "mlp.experts." in hf_name:
+        if model_type in ["qwen2moe", "deepseek2"] and "mlp.experts." in hf_name:
             hf_name = re.sub(r"mlp.experts.\d+.", "mlp.experts.", hf_name)
+        if "e_score_correction_bias" in hf_name:
+            hf_name = hf_name.replace(
+                "e_score_correction_bias", "e_score_correction.bias"
+            )
         name, suffix = hf_name, ""
         if hf_name.endswith(".weight") or hf_name.endswith(".bias"):
             name, suffix = hf_name.rsplit(".", 1)
@@ -36,9 +41,11 @@ def get_gguf_hf_weights_map(hf_model, model_type=None, num_layers=None, qual_nam
         name = "model." + name  # required for name map lookup
         gguf_name = name_map.get_name(name)
         if gguf_name is None:
+            print(f"Skipping {name} -> {hf_name}")
             continue
         gguf_to_hf_name_map[gguf_name + suffix] = qual_name + hf_name
     return gguf_to_hf_name_map
+
 
 def lazy_load_hook(module, inputs):
     input0 = inputs[0]
@@ -47,23 +54,40 @@ def lazy_load_hook(module, inputs):
     device = input0.device
 
     for attr, hf_key in getattr(module, "lazy_params", {}).items():
+        expert_idx = None
         hf_key = hf_key.replace("model.", "")
         param = getattr(module, attr)
         if param is None or (hasattr(param, "device") and param.device.type == "meta"):
             if "experts" in hf_key and "shared_experts" not in hf_key:
-                hf_key = re.sub(r"mlp.experts.\d+.", "mlp.shared_experts.", hf_key)
+                # Use regex to match the expert index part of the key
+                match = re.search(r"mlp.experts.(\d+)", hf_key)
+                if match:
+                    expert_idx = int(match.group(1))  # Get the expert index
+                    hf_key = re.sub(
+                        r"mlp.experts.(\d+)", "mlp.experts", hf_key
+                    )  # Normalize the key
+                else:
+                    expert_idx = None  # If no expert index is present, set to None
             if hf_key.endswith("e_score_correction_bias"):
-                param_tensor = torch.empty((module.n_routed_experts))
-            elif hf_key not in GLOBAL_GGUF_MAPPING:
+                hf_key = hf_key.replace(
+                    "e_score_correction_bias", "e_score_correction.bias"
+                )
+            # if hf_key.endswith("e_score_correction_bias"):
+            #     param_tensor = torch.empty((module.n_routed_experts))
+            if hf_key not in GLOBAL_GGUF_MAPPING:
                 raise ValueError(f"GGUF mapping does not contain key: {hf_key}")
             else:
                 gguf_tensor = GLOBAL_GGUF_MAPPING[hf_key]
-                param_tensor = dequantize(gguf_tensor.data, gguf_tensor.tensor_type)
+            param_tensor = dequantize(
+                gguf_tensor.data, gguf_tensor.tensor_type, expert_idx
+            )
             setattr(module, attr, param_tensor.to(device))
+
 
 def lazy_offload_hook(module, inputs, output):
     for attr in getattr(module, "lazy_params", {}):
         setattr(module, attr, None)
+
 
 def get_module_by_name(model, full_param_name):
     parts = full_param_name.split(".")
@@ -72,13 +96,14 @@ def get_module_by_name(model, full_param_name):
         mod = getattr(mod, part)
     return mod
 
+
 def remove_registered_parameters(model):
     # Do not remove parameters from these modules.
     skip_modules = {"embed_tokens", "rotary_emb", "norm"}
     for full_name, _ in list(model.named_parameters()):
         if full_name.split(".")[0] in skip_modules:
             continue
-        if full_name.split(".")[0] == 'layers' and int(full_name.split(".")[1]) < 3:
+        if full_name.split(".")[0] == "layers" and int(full_name.split(".")[1]) < 3:
             # Skip the first 3 Dense layers
             continue
         module = get_module_by_name(model, full_name)
@@ -90,15 +115,24 @@ def remove_registered_parameters(model):
             del module._parameters[attr]
         setattr(module, attr, None)
 
+
 def load_eager_module_weights(module, full_prefix, device="cuda"):
     for full_name, _ in module.named_parameters(recurse=True):
-        key = f"{full_prefix}.{full_name}"
-        if key not in GLOBAL_GGUF_MAPPING:
-            raise ValueError(f"GGUF mapping does not contain key: {key}")
-        
-        gguf_tensor = GLOBAL_GGUF_MAPPING[key]
-        loaded_tensor = dequantize(gguf_tensor.data, gguf_tensor.tensor_type).to(device)
-        
+        if "experts" in full_name and "shared_experts" not in full_name:
+            full_name = re.sub(r"mlp.experts.\d+.", "mlp.experts.", full_name)
+        if full_name.endswith("e_score_correction_bias"):
+            full_name = full_name.replace(
+                "e_score_correction_bias", "e_score_correction.bias"
+            )
+        else:
+            key = f"{full_prefix}.{full_name}"
+            if key not in GLOBAL_GGUF_MAPPING:
+                raise ValueError(f"GGUF mapping does not contain key: {key}")
+
+            gguf_tensor = GLOBAL_GGUF_MAPPING[key]
+            loaded_tensor = dequantize(gguf_tensor.data, gguf_tensor.tensor_type).to(
+                device
+            )
         # Split the full_name into its components (e.g. "submodule.weight" -> ["submodule", "weight"])
         name_parts = full_name.split(".")
         # Traverse the module hierarchy to get to the correct submodule

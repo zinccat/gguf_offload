@@ -47,10 +47,10 @@ for i in range(1, 4):
     GLOBAL_GGUF_READER = GGUFReader(gguf_path)
     for tensor in GLOBAL_GGUF_READER.tensors:
         if tensor.name not in tensor_key_mapping:
+            print(tensor.name, tensor.data.shape, "not in mapping")
             continue
         hf_key = tensor_key_mapping[tensor.name]
         GLOBAL_GGUF_MAPPING[hf_key] = tensor
-
 # Initialize the model with empty weights.
 init_contexts = [no_init_weights(_enable=True), init_empty_weights()]
 with ContextManagers(init_contexts):
@@ -71,12 +71,9 @@ load_eager_module_weights(model.norm, "norm")
 model.embed_tokens.to("cuda")
 model.norm.to("cuda")
 
-load_eager_module_weights(model.layers[0], "layers.0")
-load_eager_module_weights(model.layers[1], "layers.1")
-load_eager_module_weights(model.layers[2], "layers.2")
-model.layers[0].to("cuda")
-model.layers[1].to("cuda")
-model.layers[2].to("cuda")
+for idx in range(3):
+    load_eager_module_weights(model.layers[idx], f"layers.{idx}")
+    model.layers[idx].to("cuda")
 
 # use lm_head tied to embed_tokens
 model.lm_head = torch.nn.Linear(config.hidden_size, config.vocab_size, bias=False)

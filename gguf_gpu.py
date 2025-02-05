@@ -36,20 +36,16 @@ def quant_shape_from_byte_shape(
 
 
 # use GPU to dequantize the entire tensor at once
-def _apply_over_grouped_rows(func, arr, otype, oshape):
+def _apply_over_grouped_rows(func, arr, otype, oshape, expert_idx=None) -> torch.Tensor:
     """
     Applies the given function `func` over the entire input array on the GPU.
     This version does not split the input into groups but runs the entire operation at once.
     """
-    if arr.shape[0] == 256:
-        arr = arr[0]
+    if expert_idx is not None:
+        arr = arr[expert_idx]
         oshape = oshape[1:]
     # Convert the input array to a GPU tensor and flatten all but the last dimension.
-    # arr = arr[:arr.shape[0] // 256, ...]
-    # oshape = (oshape[0] // 256, *oshape[1:])
     rows = torch.from_numpy(arr).to("cuda", non_blocking=True).view(-1, arr.shape[-1])
-
-    print(rows.shape)
 
     # Apply the function to the entire tensor.
     out = func(rows)
@@ -86,7 +82,7 @@ def quantize(data: np.ndarray, qtype: GGMLQuantizationType) -> np.ndarray:
         )
 
 
-def dequantize(data: np.ndarray, qtype: GGMLQuantizationType) -> np.ndarray:
+def dequantize(data: np.ndarray, qtype: GGMLQuantizationType, expert_idx: int | None = None) -> torch.Tensor:
     if qtype == GGMLQuantizationType.F32:
         # return data.view(np.float32)
         return torch.from_numpy(data).to("cuda").float()
@@ -94,7 +90,7 @@ def dequantize(data: np.ndarray, qtype: GGMLQuantizationType) -> np.ndarray:
         # return data.view(np.float16).astype(np.float32)
         return torch.from_numpy(data.view(np.float16)).to("cuda").float()
     elif (q := _type_traits.get(qtype)) is not None:
-        return q.dequantize(data)
+        return q.dequantize(data, expert_idx)
     else:
         raise NotImplementedError(
             f"Dequantization for {qtype.name} is not yet implemented"
@@ -203,13 +199,14 @@ class __Quant(ABC):
         )
 
     @classmethod
-    def __dequantize_array(cls, array: np.ndarray) -> np.ndarray:
+    def __dequantize_array(cls, array: np.ndarray, expert_idx: int | None = None) -> torch.Tensor:
         cls.init_grid()
         return _apply_over_grouped_rows(
             cls.dequantize_rows,
             arr=array,
             otype=np.float32,
             oshape=cls.__shape_from_bytes(array.shape),
+            expert_idx=expert_idx,
         )
 
     @classmethod
@@ -236,11 +233,11 @@ class __Quant(ABC):
             return cls.__quantize_array(tensor)
 
     @classmethod
-    def dequantize(cls, tensor: np.ndarray | LazyNumpyTensor) -> torch.Tensor:
+    def dequantize(cls, tensor: np.ndarray | LazyNumpyTensor, expert_idx: int | None = None) -> torch.Tensor:
         if isinstance(tensor, LazyNumpyTensor):
             return cls.__dequantize_lazy(tensor)
         else:
-            return cls.__dequantize_array(tensor)
+            return cls.__dequantize_array(tensor, expert_idx)
 
 
 class BF16(__Quant, qtype=GGMLQuantizationType.BF16):
@@ -296,7 +293,7 @@ class Q4_0(__Quant, qtype=GGMLQuantizationType.Q4_0):
 
         # --- Reinterpret the first two uint8 bytes as a float16 ---
         # (Since PyTorch lacks a direct bitcast, we use NumPy for the reinterpretation)
-        d_torch = d.view(torch.float16).to(torch.float32)
+        d = d.view(torch.float16).to(torch.float32)
 
         # --- Unpack the quantized values ---
         # In the original NumPy code, qs is reshaped to (n_blocks, 1, 1, block_size//2)
@@ -313,8 +310,8 @@ class Q4_0(__Quant, qtype=GGMLQuantizationType.Q4_0):
         qs = qs.view(n_blocks, -1).to(torch.int8) - 8
 
         # Multiply the scaling factor d (broadcast along the quantized values)
-        result = d_torch * qs.to(torch.float32)
-        return result
+        d *= qs.to(torch.float32)
+        return d
 
 
 class Q4_1(__Quant, qtype=GGMLQuantizationType.Q4_1):
@@ -678,7 +675,7 @@ class Q4_K(__Quant, qtype=GGMLQuantizationType.Q4_K):
         # Perform the dequantization: scale the quantized values and subtract the offset.
         # d (shape (n_blocks, 8, 1)) multiplies qs (shape (n_blocks, 8, 32)) by broadcasting,
         # and dm is subtracted before finally reshaping to (n_blocks, QK_K)
-        result = (d * qs - dm).reshape(n_blocks, QK_K)
+        result = (d * qs - dm).view(n_blocks, QK_K)
         return result
 
 
@@ -732,7 +729,7 @@ class Q5_K(__Quant, qtype=GGMLQuantizationType.Q5_K):
         q = (ql | (qh << 4)).to(torch.float32)
 
         # Dequantization and reshape to (n_blocks, QK_K)
-        result = (d * q - dm).reshape(n_blocks, QK_K)
+        result = (d * q - dm).view(n_blocks, QK_K)
         return result
 
 
@@ -937,8 +934,6 @@ class IQ2_XXS(__Quant, qtype=GGMLQuantizationType.IQ2_XXS):
         signs = signs & 0x01
         signs = torch.where(signs == 0, 1.0, -1.0)
         signs = signs.reshape((n_blocks, -1, 4, 8))
-        # qs = qs.view(torch.uint8)
-        # qs = qs.to(torch.long)
         grid = torch.take_along_dim(
             cls.grid,
             qs[..., 0].clone().view(torch.uint8).reshape(n_blocks, -1, 1, 1).to(torch.long),
@@ -946,7 +941,10 @@ class IQ2_XXS(__Quant, qtype=GGMLQuantizationType.IQ2_XXS):
         )
         grid = grid.reshape((n_blocks, -1, 4, 8))
 
-        return (db * grid * signs).reshape((n_blocks, -1))
+        grid *= signs
+        grid *= db
+
+        return grid.view((n_blocks, -1))
 
 class IQ2_XS(__Quant, qtype=GGMLQuantizationType.IQ2_XS):
     # iq2xs_grid, but with each byte of the original packed in 2 bits,
@@ -1436,7 +1434,10 @@ class IQ1_S(__Quant, qtype=GGMLQuantizationType.IQ1_S):
 
         grid = grid.view(n_blocks, -1, 4, 8)
 
-        return (dl * (grid + delta)).view(n_blocks, -1)
+        # use inplace operations to avoid creating a new tensor
+        grid += delta
+        grid *= dl
+        return grid.view(n_blocks, -1)
 
 
 class IQ1_M(__Quant, qtype=GGMLQuantizationType.IQ1_M):
