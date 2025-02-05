@@ -310,8 +310,10 @@ class Q4_0(__Quant, qtype=GGMLQuantizationType.Q4_0):
         qs = qs.view(n_blocks, -1).to(torch.int8) - 8
 
         # Multiply the scaling factor d (broadcast along the quantized values)
-        d *= qs.to(torch.float32)
-        return d
+        # d *= qs.to(torch.float32)
+        qs = qs.to(torch.float32)
+        qs *= d
+        return qs
 
 
 class Q4_1(__Quant, qtype=GGMLQuantizationType.Q4_1):
@@ -667,16 +669,18 @@ class Q4_K(__Quant, qtype=GGMLQuantizationType.Q4_K):
             1, 1, 2, 1
         )
         qs = qs >> shift
-        qs = qs & 0x0F
-        qs = qs.reshape(n_blocks, -1, 32).to(
+        qs &= 0x0F
+        qs = qs.view(n_blocks, -1, 32).to(
             torch.float32
         )  # shape now (n_blocks, 8, 32)
 
         # Perform the dequantization: scale the quantized values and subtract the offset.
         # d (shape (n_blocks, 8, 1)) multiplies qs (shape (n_blocks, 8, 32)) by broadcasting,
         # and dm is subtracted before finally reshaping to (n_blocks, QK_K)
-        result = (d * qs - dm).view(n_blocks, QK_K)
-        return result
+        # result = (d * qs - dm).view(n_blocks, QK_K)
+        qs *= d
+        qs -= dm
+        return qs.view(n_blocks, QK_K)
 
 
 class Q5_K(__Quant, qtype=GGMLQuantizationType.Q5_K):
@@ -729,8 +733,10 @@ class Q5_K(__Quant, qtype=GGMLQuantizationType.Q5_K):
         q = (ql | (qh << 4)).to(torch.float32)
 
         # Dequantization and reshape to (n_blocks, QK_K)
-        result = (d * q - dm).view(n_blocks, QK_K)
-        return result
+        # result = (d * q - dm).view(n_blocks, QK_K)
+        q *= d
+        q -= dm
+        return q.view(n_blocks, QK_K)
 
 
 class Q6_K(__Quant, qtype=GGMLQuantizationType.Q6_K):
@@ -770,8 +776,8 @@ class Q6_K(__Quant, qtype=GGMLQuantizationType.Q6_K):
         # Combine ql and qh.
         q = (ql | (qh << 4)).to(torch.int8) - 32
         q = q.view(n_blocks, QK_K // 16, -1).to(torch.float32)
-
-        return (d * q).view(n_blocks, QK_K)
+        q *= d
+        return q.view(n_blocks, QK_K)
 
 
 class TQ1_0(__Quant, qtype=GGMLQuantizationType.TQ1_0):
@@ -919,27 +925,27 @@ class IQ2_XXS(__Quant, qtype=GGMLQuantizationType.IQ2_XXS):
 
         d = d.view(torch.float16).to(torch.float32)
 
-        qs = qs.contiguous().view(torch.int32).reshape(n_blocks, -1, 2)
+        qs = qs.contiguous().view(torch.int32).view(n_blocks, -1, 2)
 
         shifted = (qs[..., 1] >> 28) & 0xF
 
         db = d * (0.5 + shifted.to(torch.float32)) * 0.25
-        db = db.reshape((n_blocks, -1, 1, 1))
+        db = db.view((n_blocks, -1, 1, 1))
 
-        signs = qs[..., 1].reshape((n_blocks, -1, 1)) >> torch.tensor([0, 7, 14, 21], dtype=torch.int32, device=blocks.device).reshape((1, 1, 4))
-        ksigns = torch.frombuffer(cls.ksigns, dtype=torch.uint8).reshape((1, 1, 1, 128)).cuda()
-        signs = (signs & 0x7F).reshape((n_blocks, -1, 4, 1)).long()
+        signs = qs[..., 1].view((n_blocks, -1, 1)) >> torch.tensor([0, 7, 14, 21], dtype=torch.int32, device=blocks.device).view((1, 1, 4))
+        ksigns = torch.frombuffer(cls.ksigns, dtype=torch.uint8).view((1, 1, 1, 128)).cuda()
+        signs = (signs & 0x7F).view((n_blocks, -1, 4, 1)).long()
         signs = torch.take_along_dim(ksigns, signs, dim=-1)
-        signs = signs.reshape((n_blocks, -1, 4, 1)) >> torch.tensor([i for i in range(8)], dtype=torch.uint8, device=blocks.device).reshape((1, 1, 1, 8))
+        signs = signs.view((n_blocks, -1, 4, 1)) >> torch.tensor([i for i in range(8)], dtype=torch.uint8, device=blocks.device).reshape((1, 1, 1, 8))
         signs = signs & 0x01
         signs = torch.where(signs == 0, 1.0, -1.0)
-        signs = signs.reshape((n_blocks, -1, 4, 8))
+        signs = signs.view((n_blocks, -1, 4, 8))
         grid = torch.take_along_dim(
             cls.grid,
-            qs[..., 0].clone().view(torch.uint8).reshape(n_blocks, -1, 1, 1).to(torch.long),
+            qs[..., 0].clone().view(torch.uint8).view(n_blocks, -1, 1, 1).to(torch.long),
             dim=-2,
         )
-        grid = grid.reshape((n_blocks, -1, 4, 8))
+        grid = grid.view((n_blocks, -1, 4, 8))
 
         grid *= signs
         grid *= db
