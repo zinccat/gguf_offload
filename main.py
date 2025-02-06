@@ -10,6 +10,7 @@ from transformers.cache_utils import DynamicCache
 
 from deepseek.modeling_deepseek import DeepseekV3Model
 from gguf import GGUFReader
+import numpy as np
 
 from lazy_loading import (
     get_gguf_hf_weights_map,
@@ -45,6 +46,8 @@ tensor_key_mapping = get_gguf_hf_weights_map(dummy_model)
 for i in range(1, 4):
     gguf_path = f"../DeepSeek-R1-GGUF/DeepSeek-R1-UD-IQ1_S/DeepSeek-R1-UD-IQ1_S-0000{i}-of-00003.gguf"
     GLOBAL_GGUF_READER = GGUFReader(gguf_path)
+    # if i == 1:
+    #     GGUFReader.data = np.array(GLOBAL_GGUF_READER.data)
     for tensor in GLOBAL_GGUF_READER.tensors:
         if tensor.name not in tensor_key_mapping:
             print(tensor.name, tensor.data.shape, "not in mapping")
@@ -82,7 +85,7 @@ model.lm_head.to("cuda")
 
 # --- Inference Example ---
 with torch.no_grad():
-    batch_size, seq_length = 1, 128
+    batch_size, seq_length = 1, 8
     input_ids = torch.randint(0, 129280, (batch_size, seq_length)).cuda()
     past_key_value = DynamicCache()
     output_attentions = False
@@ -111,7 +114,7 @@ with torch.no_grad():
         x, past_key_value = pipelined_inference_layers(
             model.layers,
             inputs_embeds,
-            chunk_size=2,
+            chunk_size=8,
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_value=past_key_value,
@@ -130,7 +133,7 @@ with torch.no_grad():
 start = timer()
 with torch.no_grad():
     for i in range(5):
-        batch_size, seq_length = 1, 512
+        batch_size, seq_length = 1, 128
         input_ids = torch.randint(0, 129280, (batch_size, seq_length)).cuda()
         x = model.embed_tokens(input_ids)
         cache_position = torch.arange(0, x.shape[1], device=x.device)
@@ -144,7 +147,7 @@ with torch.no_grad():
         x, cache = pipelined_inference_layers(
             model.layers,
             x,
-            chunk_size=6,
+            chunk_size=4,
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_value=past_key_value,
