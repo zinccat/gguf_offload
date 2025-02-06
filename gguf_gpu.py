@@ -51,7 +51,7 @@ def _apply_over_grouped_rows(func, arr, otype, oshape, expert_idx=None) -> torch
     out = func(rows)
 
     # Reshape the output to the desired shape.
-    return out.reshape(oshape)
+    return out.view(oshape)
 
 
 # round away from zero
@@ -82,15 +82,17 @@ def quantize(data: np.ndarray, qtype: GGMLQuantizationType) -> np.ndarray:
         )
 
 
-def dequantize(data: np.ndarray, qtype: GGMLQuantizationType, expert_idx: int | None = None) -> torch.Tensor:
+def dequantize(
+    data: np.ndarray, qtype: GGMLQuantizationType, expert_idx: int | None = None
+) -> torch.Tensor:
     if qtype == GGMLQuantizationType.F32:
         # return data.view(np.float32)
-        return torch.from_numpy(data).to("cuda").float()
+        return torch.from_numpy(data).to("cuda")
     elif qtype == GGMLQuantizationType.F16:
         # return data.view(np.float16).astype(np.float32)
-        return torch.from_numpy(data.view(np.float16)).to("cuda").float()
+        return torch.from_numpy(data.view(np.float16)).float()  # .to(torch.float16)
     elif (q := _type_traits.get(qtype)) is not None:
-        return q.dequantize(data, expert_idx)
+        return q.dequantize(data, expert_idx).float()
     else:
         raise NotImplementedError(
             f"Dequantization for {qtype.name} is not yet implemented"
@@ -175,11 +177,11 @@ class __Quant(ABC):
         rows = rows.view(torch.uint8)
         shape = rows.shape
         n_blocks = rows.numel() // cls.type_size
-        blocks = rows.reshape((n_blocks, cls.type_size))
+        blocks = rows.view((n_blocks, cls.type_size))
         blocks = cls.dequantize_blocks(blocks)
         # assert blocks.dtype == np.float32
         assert blocks.shape[-1] == cls.block_size
-        return blocks.reshape(cls.__shape_from_bytes(shape))
+        return blocks.view(cls.__shape_from_bytes(shape))
 
     @classmethod
     def __shape_to_bytes(cls, shape: Sequence[int]):
@@ -199,7 +201,9 @@ class __Quant(ABC):
         )
 
     @classmethod
-    def __dequantize_array(cls, array: np.ndarray, expert_idx: int | None = None) -> torch.Tensor:
+    def __dequantize_array(
+        cls, array: np.ndarray, expert_idx: int | None = None
+    ) -> torch.Tensor:
         cls.init_grid()
         return _apply_over_grouped_rows(
             cls.dequantize_rows,
@@ -233,7 +237,9 @@ class __Quant(ABC):
             return cls.__quantize_array(tensor)
 
     @classmethod
-    def dequantize(cls, tensor: np.ndarray | LazyNumpyTensor, expert_idx: int | None = None) -> torch.Tensor:
+    def dequantize(
+        cls, tensor: np.ndarray | LazyNumpyTensor, expert_idx: int | None = None
+    ) -> torch.Tensor:
         if isinstance(tensor, LazyNumpyTensor):
             return cls.__dequantize_lazy(tensor)
         else:
@@ -670,9 +676,7 @@ class Q4_K(__Quant, qtype=GGMLQuantizationType.Q4_K):
         )
         qs = qs >> shift
         qs &= 0x0F
-        qs = qs.view(n_blocks, -1, 32).to(
-            torch.float32
-        )  # shape now (n_blocks, 8, 32)
+        qs = qs.view(n_blocks, -1, 32).to(torch.float32)  # shape now (n_blocks, 8, 32)
 
         # Perform the dequantization: scale the quantized values and subtract the offset.
         # d (shape (n_blocks, 8, 1)) multiplies qs (shape (n_blocks, 8, 32)) by broadcasting,
@@ -932,17 +936,27 @@ class IQ2_XXS(__Quant, qtype=GGMLQuantizationType.IQ2_XXS):
         db = d * (0.5 + shifted.to(torch.float32)) * 0.25
         db = db.view((n_blocks, -1, 1, 1))
 
-        signs = qs[..., 1].view((n_blocks, -1, 1)) >> torch.tensor([0, 7, 14, 21], dtype=torch.int32, device=blocks.device).view((1, 1, 4))
-        ksigns = torch.frombuffer(cls.ksigns, dtype=torch.uint8).view((1, 1, 1, 128)).cuda()
+        signs = qs[..., 1].view((n_blocks, -1, 1)) >> torch.tensor(
+            [0, 7, 14, 21], dtype=torch.int32, device=blocks.device
+        ).view((1, 1, 4))
+        ksigns = (
+            torch.frombuffer(cls.ksigns, dtype=torch.uint8).view((1, 1, 1, 128)).cuda()
+        )
         signs = (signs & 0x7F).view((n_blocks, -1, 4, 1)).long()
         signs = torch.take_along_dim(ksigns, signs, dim=-1)
-        signs = signs.view((n_blocks, -1, 4, 1)) >> torch.tensor([i for i in range(8)], dtype=torch.uint8, device=blocks.device).reshape((1, 1, 1, 8))
+        signs = signs.view((n_blocks, -1, 4, 1)) >> torch.tensor(
+            [i for i in range(8)], dtype=torch.uint8, device=blocks.device
+        ).reshape((1, 1, 1, 8))
         signs = signs & 0x01
         signs = torch.where(signs == 0, 1.0, -1.0)
         signs = signs.view((n_blocks, -1, 4, 8))
         grid = torch.take_along_dim(
             cls.grid,
-            qs[..., 0].clone().view(torch.uint8).view(n_blocks, -1, 1, 1).to(torch.long),
+            qs[..., 0]
+            .clone()
+            .view(torch.uint8)
+            .view(n_blocks, -1, 1, 1)
+            .to(torch.long),
             dim=-2,
         )
         grid = grid.view((n_blocks, -1, 4, 8))
@@ -951,6 +965,7 @@ class IQ2_XXS(__Quant, qtype=GGMLQuantizationType.IQ2_XXS):
         grid *= db
 
         return grid.view((n_blocks, -1))
+
 
 class IQ2_XS(__Quant, qtype=GGMLQuantizationType.IQ2_XS):
     # iq2xs_grid, but with each byte of the original packed in 2 bits,
