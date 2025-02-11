@@ -14,6 +14,9 @@ def chunked_layers(layers, chunk_size=4):
 def clone_module(module):
     clone = module.__new__(type(module))
     clone.__dict__ = module.__dict__.copy()
+    # remove hooks
+    # clone._forward_pre_hooks = {}
+    # clone._forward_hooks = {}
     return clone
 
 
@@ -26,6 +29,74 @@ def copy_layers_to_device(layers, device, non_blocking=True):
             new_layer.register_forward_hook(lazy_offload_hook)
         new_layers.append(new_layer.to(device, non_blocking=non_blocking))
     return new_layers
+
+
+# def copy_layers_to_device(layers, device, non_blocking=True):
+#     new_layers = []
+
+#     # Create a CUDA stream for asynchronous operations
+#     prefetch_stream = torch.cuda.Stream()
+
+#     for layer in layers:
+#         new_layer = clone_module(layer)
+
+#         with torch.cuda.stream(prefetch_stream):
+#             # for attr, hf_key in getattr(new_layer, "lazy_params", {}).items():
+#             for module in new_layer.modules():
+#                 # hf_key = hf_key.rsplit(".", 1)[0]
+#                 # expert_idx = None
+#                 # module = get_module_by_name(new_layer, hf_key)
+#                 if getattr(module, "lazy_params", None) is None:
+#                     continue
+#                 for attr, hf_key in module.lazy_params.items():
+#                     param = getattr(module, attr)
+#                     # Check if the parameter is not loaded yet and needs to be fetched
+#                     if param is None or (hasattr(param, "device") and param.device.type == "meta"):
+#                         map_key = hf_key
+#                         if "experts" in map_key and "shared_experts" not in map_key:
+#                             continue
+#                             match = re.search(r"mlp.experts.(\d+)", hf_key)
+#                             if match:
+#                                 expert_idx = int(match.group(1))
+#                                 hf_key = re.sub(r"mlp.experts.(\d+)", "mlp.experts", hf_key)
+#                             else:
+#                                 expert_idx = None
+#                         else:
+#                             expert_idx = None
+
+#                         if map_key.endswith("e_score_correction_bias"):
+#                             map_key = map_key.replace("e_score_correction_bias", "e_score_correction.bias")
+
+#                         # Fetch weights from GLOBAL_GGUF_MAPPING
+#                         if map_key not in GLOBAL_GGUF_MAPPING:
+#                             raise ValueError(f"GGUF mapping does not contain key: {map_key}")
+#                         else:
+#                             gguf_tensor = GLOBAL_GGUF_MAPPING[map_key]
+#                         # print(map_key, id(gguf_tensor.data))
+#                         # Dequantize and move tensor to device asynchronously
+#                         param_tensor = dequantize(gguf_tensor.data, gguf_tensor.tensor_type, expert_idx)
+#                         # setattr(new_layer, attr, param_tensor.to(device, non_blocking=non_blocking))
+#                         hf_key = hf_key.split(".", 2)[-1]
+#                         # setattr(new_layer, hf_key.split(".", 2)[-1], param_tensor.to(device, non_blocking=non_blocking))
+#                         # setattr by traversing the module hierarchy
+#                         parts = hf_key.split(".")
+#                         current_module = new_layer
+#                         last_part = ""
+#                         for part in parts[:-1]:
+#                             if last_part == "experts":
+#                                 current_module = current_module[expert_idx]
+#                             else:
+#                                 current_module = getattr(current_module, part)
+#                             last_part = part
+#                         setattr(current_module, parts[-1], param_tensor.to(device, non_blocking=non_blocking))
+
+#         # Now that weights are prefetched, move the layer to the GPU asynchronously
+#         new_layers.append(new_layer.to(device, non_blocking=non_blocking))
+
+#     # Synchronize the prefetch stream to ensure all operations complete before returning
+#     prefetch_stream.synchronize()
+
+#     return new_layers
 
 
 def run_chunk(
@@ -125,4 +196,5 @@ def pipelined_inference_layers(
     if use_cache:
         return y, layer_output[1]
 
+    # torch.cuda.empty_cache()
     return y

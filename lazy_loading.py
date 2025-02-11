@@ -41,7 +41,7 @@ def get_gguf_hf_weights_map(hf_model, model_type=None, num_layers=None, qual_nam
         name = "model." + name  # required for name map lookup
         gguf_name = name_map.get_name(name)
         if gguf_name is None:
-            print(f"Skipping {name} -> {hf_name}")
+            # print(f"Skipping {name} -> {hf_name}")
             continue
         gguf_to_hf_name_map[gguf_name + suffix] = qual_name + hf_name
     return gguf_to_hf_name_map
@@ -51,9 +51,10 @@ def lazy_load_hook(module, inputs):
     input0 = inputs[0]
     if isinstance(input0, (tuple, list)):
         input0 = input0[0]
-    device = input0.device
 
     for attr, hf_key in getattr(module, "lazy_params", {}).items():
+        if getattr(module, attr) is not None:
+            continue
         expert_idx = None
         hf_key = hf_key.replace("model.", "")
         param = getattr(module, attr)
@@ -72,16 +73,42 @@ def lazy_load_hook(module, inputs):
                 hf_key = hf_key.replace(
                     "e_score_correction_bias", "e_score_correction.bias"
                 )
-            # if hf_key.endswith("e_score_correction_bias"):
-            #     param_tensor = torch.empty((module.n_routed_experts))
             if hf_key not in GLOBAL_GGUF_MAPPING:
                 raise ValueError(f"GGUF mapping does not contain key: {hf_key}")
             else:
                 gguf_tensor = GLOBAL_GGUF_MAPPING[hf_key]
-            param_tensor = dequantize(
-                gguf_tensor.data, gguf_tensor.tensor_type, expert_idx
-            )
-            setattr(module, attr, param_tensor.to(device))
+            # print(f"Loaded {hf_key} into {attr}")
+            if "weight" not in hf_key or "norm" in hf_key or "gate.weight" in hf_key:
+                # all fp32 weights
+                param_tensor = torch.from_numpy(gguf_tensor.data).to("cuda")
+                if 'norm' in hf_key:
+                    param_tensor = param_tensor.half()
+                setattr(module, attr, param_tensor)
+            else:
+                if expert_idx is not None:
+                    setattr(
+                        module,
+                        attr,
+                        torch.from_numpy(gguf_tensor.data[expert_idx]).to("cuda"),
+                    )
+                else:
+                    setattr(module, attr, torch.from_numpy(gguf_tensor.data).to("cuda"))
+                setattr(module, "weight_type", int(gguf_tensor.tensor_type))
+
+
+def load_experts(experts, layer_idx, experts_idx):
+    keys = ["up_proj.weight", "down_proj.weight", "gate_proj.weight"]
+    for key in keys:
+        hf_key = f"layers.{layer_idx}.mlp.experts.{key}"
+        if hf_key not in GLOBAL_GGUF_MAPPING:
+            raise ValueError(f"GGUF mapping does not contain key: {hf_key}")
+        gguf_tensor = GLOBAL_GGUF_MAPPING[hf_key]
+        param_tensor = dequantize(
+            gguf_tensor.data, gguf_tensor.tensor_type, experts_idx
+        )
+        # setattr(experts, key, param_tensor)
+        for i, idx in enumerate(experts_idx):
+            setattr(experts[idx], key, param_tensor[i])
 
 
 def lazy_offload_hook(module, inputs, output):

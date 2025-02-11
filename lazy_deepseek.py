@@ -27,8 +27,10 @@ torch.manual_seed(0)
 logger = logging.get_logger(__name__)
 torch.set_grad_enabled(False)
 torch.backends.cudnn.benchmark = True
+# torch.cuda.set_per_process_memory_fraction(0.4)
 # use tf32
-torch.backends.cuda.matmul.allow_tf32 = True
+# torch.backends.cuda.matmul.allow_tf32 = True
+# torch.backends.cudnn.allow_tf32 = True
 
 if is_torch_fx_available():
     _prepare_4d_causal_attention_mask = torch.fx.wrap(_prepare_4d_causal_attention_mask)
@@ -93,7 +95,7 @@ with torch.no_grad():
     past_key_values_length = 0
     start = timer()
     for i in range(10):
-        inputs_embeds = model.embed_tokens(input_ids)
+        inputs_embeds = model.embed_tokens(input_ids).half()
         if use_cache:
             past_key_values_length = past_key_value.get_usable_length(seq_length)
         attention_mask = _prepare_4d_causal_attention_mask(
@@ -114,7 +116,7 @@ with torch.no_grad():
         x, past_key_value = pipelined_inference_layers(
             model.layers,
             inputs_embeds,
-            chunk_size=8,
+            chunk_size=32,
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_value=past_key_value,
@@ -127,7 +129,7 @@ with torch.no_grad():
         print("Final output:", logits[0, 0, :5])
         input_ids = torch.argmax(last_token_logits, dim=-1, keepdim=True)
         seq_length = 1  # new token
-        print(timer() - start)
+        print(i, timer() - start)
         start = timer()
         # exit()
 start = timer()

@@ -36,14 +36,11 @@ def quant_shape_from_byte_shape(
 
 
 # use GPU to dequantize the entire tensor at once
-def _apply_over_grouped_rows(func, arr, otype, oshape, expert_idx=None) -> torch.Tensor:
+def _apply_over_grouped_rows(func, arr, otype, oshape) -> torch.Tensor:
     """
     Applies the given function `func` over the entire input array on the GPU.
     This version does not split the input into groups but runs the entire operation at once.
     """
-    if expert_idx is not None:
-        arr = arr[expert_idx]
-        oshape = oshape[1:]
     # Convert the input array to a GPU tensor and flatten all but the last dimension.
     rows = torch.from_numpy(arr).to("cuda", non_blocking=True).view(-1, arr.shape[-1])
 
@@ -83,16 +80,16 @@ def quantize(data: np.ndarray, qtype: GGMLQuantizationType) -> np.ndarray:
 
 
 def dequantize(
-    data: np.ndarray, qtype: GGMLQuantizationType, expert_idx: int | None = None
+    data: np.ndarray, qtype: GGMLQuantizationType
 ) -> torch.Tensor:
     if qtype == GGMLQuantizationType.F32:
         # return data.view(np.float32)
-        return torch.from_numpy(data).to("cuda")
+        return torch.from_numpy(data).to("cuda", non_blocking=True).to(torch.float16)
     elif qtype == GGMLQuantizationType.F16:
         # return data.view(np.float16).astype(np.float32)
-        return torch.from_numpy(data.view(np.float16)).float()  # .to(torch.float16)
+        return torch.from_numpy(data.view(np.float16))  # .to(torch.float16)
     elif (q := _type_traits.get(qtype)) is not None:
-        return q.dequantize(data, expert_idx).float()
+        return q.dequantize(data)  # .float()
     else:
         raise NotImplementedError(
             f"Dequantization for {qtype.name} is not yet implemented"
@@ -148,7 +145,7 @@ class __Quant(ABC):
         grid_map = np.array(cls.grid_map, dtype=np.float32).reshape((1, -1))
         grid = np.take_along_axis(grid_map, grid, axis=-1)
         cls.grid = grid.reshape((1, 1, *cls.grid_shape))
-        cls.grid = torch.from_numpy(cls.grid).to(torch.float32).cuda()
+        cls.grid = torch.from_numpy(cls.grid).to(torch.float16).cuda()
 
     @classmethod
     @abstractmethod
@@ -209,8 +206,7 @@ class __Quant(ABC):
             cls.dequantize_rows,
             arr=array,
             otype=np.float32,
-            oshape=cls.__shape_from_bytes(array.shape),
-            expert_idx=expert_idx,
+            oshape=cls.__shape_from_bytes(array.shape)
         )
 
     @classmethod
@@ -238,12 +234,12 @@ class __Quant(ABC):
 
     @classmethod
     def dequantize(
-        cls, tensor: np.ndarray | LazyNumpyTensor, expert_idx: int | None = None
+        cls, tensor: np.ndarray | LazyNumpyTensor
     ) -> torch.Tensor:
         if isinstance(tensor, LazyNumpyTensor):
             return cls.__dequantize_lazy(tensor)
         else:
-            return cls.__dequantize_array(tensor, expert_idx)
+            return cls.__dequantize_array(tensor)
 
 
 class BF16(__Quant, qtype=GGMLQuantizationType.BF16):
@@ -299,7 +295,7 @@ class Q4_0(__Quant, qtype=GGMLQuantizationType.Q4_0):
 
         # --- Reinterpret the first two uint8 bytes as a float16 ---
         # (Since PyTorch lacks a direct bitcast, we use NumPy for the reinterpretation)
-        d = d.view(torch.float16).to(torch.float32)
+        d = d.view(torch.float16)
 
         # --- Unpack the quantized values ---
         # In the original NumPy code, qs is reshaped to (n_blocks, 1, 1, block_size//2)
@@ -317,7 +313,7 @@ class Q4_0(__Quant, qtype=GGMLQuantizationType.Q4_0):
 
         # Multiply the scaling factor d (broadcast along the quantized values)
         # d *= qs.to(torch.float32)
-        qs = qs.to(torch.float32)
+        qs = qs.to(torch.float16)
         qs *= d
         return qs
 
@@ -588,6 +584,7 @@ class Q3_K(__Quant, qtype=GGMLQuantizationType.Q3_K):
 
 class Q4_K(__Quant, qtype=GGMLQuantizationType.Q4_K):
     K_SCALE_SIZE = 12
+    shift = torch.tensor([0, 4], dtype=torch.uint8, device="cuda").view(1, 1, 2, 1)
 
     @staticmethod
     def get_scale_min(scales: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -642,24 +639,28 @@ class Q4_K(__Quant, qtype=GGMLQuantizationType.Q4_K):
         """
         n_blocks = blocks.size(0)
         # Split off the first 2 bytes (d) and the rest.
-        d, rest = torch.split(blocks, [2, blocks.size(1) - 2], dim=1)
-        # Next 2 bytes are dmin; split them from the rest.
-        dmin, rest = torch.split(rest, [2, rest.size(1) - 2], dim=1)
-        # Next K_SCALE_SIZE bytes hold the scales/mins; the remaining bytes are qs.
-        scales, qs = torch.split(
-            rest, [Q4_K.K_SCALE_SIZE, rest.size(1) - Q4_K.K_SCALE_SIZE], dim=1
+        # d, rest = torch.split(blocks, [2, blocks.size(1) - 2], dim=1)
+        # # Next 2 bytes are dmin; split them from the rest.
+        # dmin, rest = torch.split(rest, [2, rest.size(1) - 2], dim=1)
+        # # Next K_SCALE_SIZE bytes hold the scales/mins; the remaining bytes are qs.
+        # scales, qs = torch.split(
+        #     rest, [Q4_K.K_SCALE_SIZE, rest.size(1) - Q4_K.K_SCALE_SIZE], dim=1
+        # )
+
+        d, dmin, scales, qs = torch.split(
+            blocks, [2, 2, Q4_K.K_SCALE_SIZE, blocks.size(1) - 16], dim=1
         )
 
         # Reinterpret the raw 2-byte sequences as float16 and convert to float32.
         # (This view-based reinterpretation works when the underlying memory layout is correct.)
-        d = d.view(torch.float16).to(torch.float32)
-        dmin = dmin.view(torch.float16).to(torch.float32)
+        d = d.view(torch.float16)
+        dmin = dmin.view(torch.float16)
 
         # Extract the per-block scale and minimum vectors (each shape (n_blocks, 8))
         sc, m = cls.get_scale_min(scales)
         # Convert these from uint8 to float32 for multiplication
-        sc = sc.to(torch.float32)
-        m = m.to(torch.float32)
+        sc = sc.to(torch.float16)
+        m = m.to(torch.float16)
 
         # Multiply the extracted d and dmin by their corresponding scales.
         # d has shape (n_blocks, 1) and sc is (n_blocks, 8) → result will broadcast to (n_blocks, 8).
@@ -671,20 +672,19 @@ class Q4_K(__Quant, qtype=GGMLQuantizationType.Q4_K):
         # we eventually obtain a tensor of shape (n_blocks, 8, 32).
         qs = qs.reshape(n_blocks, -1, 1, 32)
         # Create a shift tensor to extract the lower and upper nibbles.
-        shift = torch.tensor([0, 4], dtype=torch.uint8, device=blocks.device).view(
-            1, 1, 2, 1
-        )
-        qs = qs >> shift
-        qs &= 0x0F
-        qs = qs.view(n_blocks, -1, 32).to(torch.float32)  # shape now (n_blocks, 8, 32)
+        return (
+            ((qs >> cls.shift) & 0x0F).view(n_blocks, -1, 32).to(torch.float16) * d - dm
+        ).view(n_blocks, QK_K)
+        # qs &= 0x0F
+        # qs = qs.view(n_blocks, -1, 32).to(torch.float16)  # shape now (n_blocks, 8, 32)
 
         # Perform the dequantization: scale the quantized values and subtract the offset.
         # d (shape (n_blocks, 8, 1)) multiplies qs (shape (n_blocks, 8, 32)) by broadcasting,
         # and dm is subtracted before finally reshaping to (n_blocks, QK_K)
         # result = (d * qs - dm).view(n_blocks, QK_K)
-        qs *= d
-        qs -= dm
-        return qs.view(n_blocks, QK_K)
+        # qs *= d
+        # qs -= dm
+        # return qs.view(n_blocks, QK_K)
 
 
 class Q5_K(__Quant, qtype=GGMLQuantizationType.Q5_K):
@@ -697,21 +697,20 @@ class Q5_K(__Quant, qtype=GGMLQuantizationType.Q5_K):
         n_blocks = blocks.size(0)
 
         # Split the blocks: first 2 bytes for d, next 2 bytes for dmin, and remaining parts
-        d, rest = torch.split(blocks, [2, blocks.size(1) - 2], dim=1)
-        dmin, rest = torch.split(rest, [2, rest.size(1) - 2], dim=1)
-        scales, rest = torch.split(
-            rest, [Q4_K.K_SCALE_SIZE, rest.size(1) - Q4_K.K_SCALE_SIZE], dim=1
+        d, dmin, scales, qh, qs = torch.split(
+            blocks,
+            [2, 2, Q4_K.K_SCALE_SIZE, QK_K // 8, blocks.size(1) - 16 - QK_K // 8],
+            dim=1,
         )
-        qh, qs = torch.split(rest, [QK_K // 8, rest.size(1) - QK_K // 8], dim=1)
 
         # Reinterpret the first two bytes as float16 and convert to float32.
-        d = d.view(torch.float16).to(torch.float32)
-        dmin = dmin.view(torch.float16).to(torch.float32)
+        d = d.view(torch.float16)
+        dmin = dmin.view(torch.float16)
 
         # Unpack scale and min values
         sc, m = Q4_K.get_scale_min(scales)
-        sc = sc.to(torch.float32)
-        m = m.to(torch.float32)
+        sc = sc.to(torch.float16)
+        m = m.to(torch.float16)
 
         # Multiply d by scale factors and reshape for broadcasting
         d = (d * sc).view(n_blocks, -1, 1)  # shape (n_blocks, 8, 1)
@@ -719,11 +718,7 @@ class Q5_K(__Quant, qtype=GGMLQuantizationType.Q5_K):
 
         # Process qs for lower 4-bits (ql)
         ql = qs.reshape(n_blocks, -1, 1, 32)
-        shift_q = torch.tensor([0, 4], dtype=torch.uint8, device=blocks.device).view(
-            1, 1, 2, 1
-        )
-        ql = ql >> shift_q
-        ql = (ql & 0x0F).reshape(n_blocks, -1, 32)
+        ql = ((ql >> Q4_K.shift) & 0x0F).reshape(n_blocks, -1, 32)
 
         # Process qh for higher 1-bit values
         qh = qh.reshape(n_blocks, -1, 1, 32)
@@ -734,13 +729,10 @@ class Q5_K(__Quant, qtype=GGMLQuantizationType.Q5_K):
         qh = (qh & 0x01).reshape(n_blocks, -1, 32)
 
         # Combine ql and qh to form the final quantized value
-        q = (ql | (qh << 4)).to(torch.float32)
+        return ((ql | (qh << 4)).to(torch.float16) * d - dm).view(n_blocks, QK_K)
 
         # Dequantization and reshape to (n_blocks, QK_K)
         # result = (d * q - dm).view(n_blocks, QK_K)
-        q *= d
-        q -= dm
-        return q.view(n_blocks, QK_K)
 
 
 class Q6_K(__Quant, qtype=GGMLQuantizationType.Q6_K):
@@ -753,20 +745,25 @@ class Q6_K(__Quant, qtype=GGMLQuantizationType.Q6_K):
         """
         n_blocks = blocks.size(0)
         # Split into segments.
-        ql, rest = torch.split(blocks, [QK_K // 2, blocks.size(1) - QK_K // 2], dim=1)
-        qh, rest = torch.split(rest, [QK_K // 4, rest.size(1) - QK_K // 4], dim=1)
-        scales, d = torch.split(rest, [QK_K // 16, rest.size(1) - QK_K // 16], dim=1)
-        scales = scales.view(torch.int8).to(torch.float32)
-        d = d.view(torch.float16).to(torch.float32)
-        # d = d.view(n_blocks, QK_K // 16, 1)
-        d = (d * scales).view(n_blocks, QK_K // 16, 1)
+        # ql, rest = torch.split(blocks, [QK_K // 2, blocks.size(1) - QK_K // 2], dim=1)
+        # qh, rest = torch.split(rest, [QK_K // 4, rest.size(1) - QK_K // 4], dim=1)
+        # scales, d = torch.split(rest, [QK_K // 16, rest.size(1) - QK_K // 16], dim=1)
+        ql, qh, scales, d = torch.split(
+            blocks,
+            [
+                QK_K // 2,
+                QK_K // 4,
+                QK_K // 16,
+                blocks.size(1) - QK_K // 2 - QK_K // 4 - QK_K // 16,
+            ],
+            dim=1,
+        )
+        scales = scales.view(torch.int8)  # .to(torch.float16)
+        d = (d.view(torch.float16) * scales).view(n_blocks, QK_K // 16, 1)
 
         # Unpack low 4-bit values from ql.
         ql = ql.view(n_blocks, -1, 1, 64)
-        shift_tensor = torch.tensor(
-            [0, 4], dtype=torch.uint8, device=blocks.device
-        ).view(1, 1, 2, 1)
-        ql = ql >> shift_tensor
+        ql = ql >> Q4_K.shift
         ql = (ql & 0x0F).view(n_blocks, -1, 32)
 
         # Unpack 2-bit values from qh.
@@ -779,9 +776,9 @@ class Q6_K(__Quant, qtype=GGMLQuantizationType.Q6_K):
 
         # Combine ql and qh.
         q = (ql | (qh << 4)).to(torch.int8) - 32
-        q = q.view(n_blocks, QK_K // 16, -1).to(torch.float32)
-        q *= d
-        return q.view(n_blocks, QK_K)
+        return (q.view(n_blocks, QK_K // 16, -1).to(torch.float16) * d).view(
+            n_blocks, QK_K
+        )
 
 
 class TQ1_0(__Quant, qtype=GGMLQuantizationType.TQ1_0):
@@ -922,19 +919,17 @@ class IQ2_XXS(__Quant, qtype=GGMLQuantizationType.IQ2_XXS):
 
     @classmethod
     def dequantize_blocks(cls, blocks: torch.Tensor) -> torch.Tensor:
-        cls.init_grid()
         n_blocks = blocks.size(0)
 
         d, qs = torch.split(blocks, [2, blocks.size(1) - 2], dim=1)
 
-        d = d.view(torch.float16).to(torch.float32)
+        d = d.view(torch.float16)
 
         qs = qs.contiguous().view(torch.int32).view(n_blocks, -1, 2)
 
-        shifted = (qs[..., 1] >> 28) & 0xF
-
-        db = d * (0.5 + shifted.to(torch.float32)) * 0.25
-        db = db.view((n_blocks, -1, 1, 1))
+        db = (d * (0.5 + ((qs[..., 1] >> 28) & 0xF).to(torch.float16)) * 0.25).view(
+            (n_blocks, -1, 1, 1)
+        )
 
         signs = qs[..., 1].view((n_blocks, -1, 1)) >> torch.tensor(
             [0, 7, 14, 21], dtype=torch.int32, device=blocks.device
@@ -942,29 +937,30 @@ class IQ2_XXS(__Quant, qtype=GGMLQuantizationType.IQ2_XXS):
         ksigns = (
             torch.frombuffer(cls.ksigns, dtype=torch.uint8).view((1, 1, 1, 128)).cuda()
         )
-        signs = (signs & 0x7F).view((n_blocks, -1, 4, 1)).long()
-        signs = torch.take_along_dim(ksigns, signs, dim=-1)
+        signs = torch.take_along_dim(
+            ksigns, (signs & 0x7F).view((n_blocks, -1, 4, 1)).long(), dim=-1
+        )
         signs = signs.view((n_blocks, -1, 4, 1)) >> torch.tensor(
             [i for i in range(8)], dtype=torch.uint8, device=blocks.device
         ).reshape((1, 1, 1, 8))
-        signs = signs & 0x01
-        signs = torch.where(signs == 0, 1.0, -1.0)
-        signs = signs.view((n_blocks, -1, 4, 8))
-        grid = torch.take_along_dim(
-            cls.grid,
-            qs[..., 0]
-            .clone()
-            .view(torch.uint8)
-            .view(n_blocks, -1, 1, 1)
-            .to(torch.long),
-            dim=-2,
+        signs = (
+            torch.where((signs & 0x01) == 0, 1.0, -1.0)
+            .to(torch.float16)
+            .view((n_blocks, -1, 4, 8))
         )
-        grid = grid.view((n_blocks, -1, 4, 8))
-
-        grid *= signs
-        grid *= db
-
-        return grid.view((n_blocks, -1))
+        return (
+            torch.take_along_dim(
+                cls.grid,
+                qs[..., 0]
+                .clone()
+                .view(torch.uint8)
+                .view(n_blocks, -1, 1, 1)
+                .to(torch.long),
+                dim=-2,
+            ).view((n_blocks, -1, 4, 8))
+            * signs
+            * db
+        ).view((n_blocks, -1))
 
 
 class IQ2_XS(__Quant, qtype=GGMLQuantizationType.IQ2_XS):
@@ -1424,7 +1420,8 @@ class IQ1_S(__Quant, qtype=GGMLQuantizationType.IQ1_S):
         b"20aa22aa28aa2aaa51aa54aa56aa80aa82aa88aa8aaa95aaa0aaa2aaa8aaaaaa"
     )
 
-    delta = np.float32(0.125)
+    # delta = np.float32(0.125)
+    delta = torch.tensor(0.125, dtype=torch.float16)
 
     @classmethod
     def dequantize_blocks(cls, blocks: torch.Tensor) -> torch.Tensor:
@@ -1435,30 +1432,31 @@ class IQ1_S(__Quant, qtype=GGMLQuantizationType.IQ1_S):
         """
         n_blocks = blocks.size(0)
 
-        d, rest = torch.split(blocks, [2, blocks.size(1) - 2], dim=1)
-        qs, qh = torch.split(rest, [QK_K // 8, blocks.size(1) - 2 - QK_K // 8], dim=1)
+        d, qs, qh = blocks.split([2, QK_K // 8, blocks.size(1) - 2 - QK_K // 8], dim=1)
 
-        d = d.view(torch.float16).to(torch.float32)
+        d = d.view(torch.float16)
         qh = qh.view(torch.int16)
 
-        dl = d * (2 * ((qh >> 12) & 7) + 1)
-        dl = dl.reshape(n_blocks, -1, 1, 1)
-        delta = torch.where((qh & 0x8000) == 0, cls.delta, -cls.delta)
-        delta = delta.reshape(n_blocks, -1, 1, 1)
-
+        dl = (d * (2 * ((qh >> 12) & 7) + 1)).view(n_blocks, -1, 1, 1)
+        delta = torch.where((qh & 0x8000) == 0, cls.delta, -cls.delta).view(
+            n_blocks, -1, 1, 1
+        )
         qh = qh.reshape(n_blocks, -1, 1) >> torch.tensor(
             [0, 3, 6, 9], dtype=torch.int16, device=blocks.device
         ).view(1, 1, 4)
-        qs = qs.to(torch.int16) | ((qh & 7) << 8).reshape((n_blocks, -1))
-        qs = qs.to(torch.long)
-        grid = torch.take_along_dim(cls.grid, qs.view(n_blocks, -1, 1, 1), dim=-2)
 
-        grid = grid.view(n_blocks, -1, 4, 8)
-
-        # use inplace operations to avoid creating a new tensor
-        grid += delta
-        grid *= dl
-        return grid.view(n_blocks, -1)
+        qs = (qs.to(torch.int16) | ((qh & 7) << 8).reshape((n_blocks, -1))).to(
+            torch.long
+        )
+        return (
+            (
+                torch.take_along_dim(
+                    cls.grid, qs.view(n_blocks, -1, 1, 1), dim=-2
+                ).view(n_blocks, -1, 4, 8)
+                + delta
+            )
+            * dl
+        ).view(n_blocks, -1)
 
 
 class IQ1_M(__Quant, qtype=GGMLQuantizationType.IQ1_M):
