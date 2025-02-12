@@ -19,8 +19,8 @@ from lazy_loading import (
     GLOBAL_GGUF_READER,
     lazy_load_hook,
     lazy_offload_hook,
+    pipelined_inference_layers
 )
-from inference import pipelined_inference_layers
 
 
 torch.manual_seed(0)
@@ -48,8 +48,8 @@ tensor_key_mapping = get_gguf_hf_weights_map(dummy_model)
 # Load GGUF files and update the global mapping.
 for i in range(1, 4):
     gguf_path = f"../DeepSeek-R1-GGUF/DeepSeek-R1-UD-IQ1_S/DeepSeek-R1-UD-IQ1_S-0000{i}-of-00003.gguf"
-# for i in range(1, 6):
-#     gguf_path = f"../DeepSeek-R1-GGUF/DeepSeek-R1-Q2_K_XS/DeepSeek-R1-Q2_K_XS-0000{i}-of-00005.gguf"
+    # for i in range(1, 6):
+    #     gguf_path = f"../DeepSeek-R1-GGUF/DeepSeek-R1-Q2_K_XS/DeepSeek-R1-Q2_K_XS-0000{i}-of-00005.gguf"
     GLOBAL_GGUF_READER = GGUFReader(gguf_path)
     # if i == 1:
     #     GGUFReader.data = np.array(GLOBAL_GGUF_READER.data)
@@ -58,7 +58,10 @@ for i in range(1, 4):
             print(tensor.name, tensor.data.shape, "not in mapping")
             continue
         hf_key = tensor_key_mapping[tensor.name]
-        GLOBAL_GGUF_MAPPING[hf_key] = (torch.from_numpy(tensor.data), tensor.tensor_type)
+        GLOBAL_GGUF_MAPPING[hf_key] = (
+            torch.from_numpy(tensor.data),
+            tensor.tensor_type,
+        )
 # Initialize the model with empty weights.
 init_contexts = [no_init_weights(_enable=True), init_empty_weights()]
 with ContextManagers(init_contexts):
@@ -74,7 +77,7 @@ for module in model.modules():
         module.register_forward_pre_hook(lazy_load_hook)
         module.register_forward_hook(lazy_offload_hook)
 
-# model = torch.compile(model)
+model = torch.compile(model)
 model.eval()
 
 # Eagerly load weights for modules that should always remain on GPU.
@@ -82,10 +85,6 @@ load_eager_module_weights(model.embed_tokens, "embed_tokens")
 load_eager_module_weights(model.norm, "norm")
 model.embed_tokens.to("cuda")
 model.norm.to("cuda")
-
-for idx in range(3):
-    load_eager_module_weights(model.layers[idx], f"layers.{idx}")
-    model.layers[idx].to("cuda")
 
 # use lm_head tied to embed_tokens
 model.lm_head = torch.nn.Linear(config.hidden_size, config.vocab_size, bias=False)
@@ -96,14 +95,14 @@ model.lm_head.weight = model.embed_tokens.weight
 
 # --- Inference Example ---
 with torch.no_grad():
-    batch_size, seq_length = 1, 8
+    batch_size, seq_length = 1, 64
     input_ids = torch.randint(0, 129280, (batch_size, seq_length)).cuda()
     past_key_value = DynamicCache()
     output_attentions = False
     use_cache = True
     past_key_values_length = 0
     start = timer()
-    for i in range(10):
+    for i in range(50):
         inputs_embeds = model.embed_tokens(input_ids).half()
         if use_cache:
             past_key_values_length = past_key_value.get_usable_length(seq_length)
@@ -125,7 +124,6 @@ with torch.no_grad():
         x, past_key_value = pipelined_inference_layers(
             model.layers,
             inputs_embeds,
-            chunk_size=32,
             # attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_value=past_key_value,
