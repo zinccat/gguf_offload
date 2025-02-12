@@ -189,9 +189,9 @@ def pipelined_inference_layers(
         with torch.cuda.stream(cleanup_stream):
             cleanup_stream.wait_event(compute_done_events[i])
             gpu_chunks[i] = None  # Free GPU memory.
-    comp_stream.synchronize()
-    load_stream.synchronize()
-    cleanup_stream.synchronize()
+    # comp_stream.synchronize()
+    # load_stream.synchronize()
+    # cleanup_stream.synchronize()
 
     if use_cache:
         return y, layer_output[1]

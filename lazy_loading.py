@@ -76,11 +76,11 @@ def lazy_load_hook(module, inputs):
             if hf_key not in GLOBAL_GGUF_MAPPING:
                 raise ValueError(f"GGUF mapping does not contain key: {hf_key}")
             else:
-                gguf_tensor = GLOBAL_GGUF_MAPPING[hf_key]
+                gguf_tensor, dtype = GLOBAL_GGUF_MAPPING[hf_key]
             # print(f"Loaded {hf_key} into {attr}")
             if "weight" not in hf_key or "norm" in hf_key or "gate.weight" in hf_key:
                 # all fp32 weights
-                param_tensor = torch.from_numpy(gguf_tensor.data).to("cuda")
+                param_tensor = gguf_tensor.to("cuda", non_blocking=True)
                 if 'norm' in hf_key:
                     param_tensor = param_tensor.half()
                 setattr(module, attr, param_tensor)
@@ -89,11 +89,11 @@ def lazy_load_hook(module, inputs):
                     setattr(
                         module,
                         attr,
-                        torch.from_numpy(gguf_tensor.data[expert_idx]).to("cuda"),
+                        gguf_tensor[expert_idx].to("cuda", non_blocking=True),
                     )
                 else:
-                    setattr(module, attr, torch.from_numpy(gguf_tensor.data).to("cuda"))
-                setattr(module, "weight_type", int(gguf_tensor.tensor_type))
+                    setattr(module, attr, gguf_tensor.to("cuda", non_blocking=True))
+                setattr(module, "weight_type", int(dtype))
 
 
 def load_experts(experts, layer_idx, experts_idx):
@@ -102,13 +102,14 @@ def load_experts(experts, layer_idx, experts_idx):
         hf_key = f"layers.{layer_idx}.mlp.experts.{key}"
         if hf_key not in GLOBAL_GGUF_MAPPING:
             raise ValueError(f"GGUF mapping does not contain key: {hf_key}")
-        gguf_tensor = GLOBAL_GGUF_MAPPING[hf_key]
-        param_tensor = dequantize(
-            gguf_tensor.data, gguf_tensor.tensor_type, experts_idx
-        )
+        gguf_tensor, dtype = GLOBAL_GGUF_MAPPING[hf_key]
+        # param_tensor = dequantize(
+        #     gguf_tensor.data, gguf_tensor.tensor_type, experts_idx
+        # )
         # setattr(experts, key, param_tensor)
         for i, idx in enumerate(experts_idx):
-            setattr(experts[idx], key, param_tensor[i])
+            setattr(experts[idx], key, gguf_tensor[i].to("cuda", non_blocking=True))
+            setattr(experts[idx], "weight_type", int(dtype))
 
 
 def lazy_offload_hook(module, inputs, output):
@@ -128,12 +129,18 @@ def remove_registered_parameters(model):
     # Do not remove parameters from these modules.
     skip_modules = {"embed_tokens", "rotary_emb", "norm"}
     for full_name, _ in list(model.named_parameters()):
+        module = get_module_by_name(model, full_name)
         if full_name.split(".")[0] in skip_modules:
+            # setattr(module, "load_once", True)
             continue
         if full_name.split(".")[0] == "layers" and int(full_name.split(".")[1]) < 3:
             # Skip the first 3 Dense layers
+            # setattr(module, "load_once", True)
             continue
-        module = get_module_by_name(model, full_name)
+        if 'shared_experts' in full_name or 'mlp.gate' in full_name or 'norm' in full_name or 'self_attn' in full_name:
+            setattr(module, "load_once", True)
+        elif 'experts' not in full_name:
+            print(f"Lazy loading {full_name}")
         attr = full_name.split(".")[-1]
         if not hasattr(module, "lazy_params"):
             module.lazy_params = {}
@@ -156,9 +163,12 @@ def load_eager_module_weights(module, full_prefix, device="cuda"):
             if key not in GLOBAL_GGUF_MAPPING:
                 raise ValueError(f"GGUF mapping does not contain key: {key}")
 
-            gguf_tensor = GLOBAL_GGUF_MAPPING[key]
-            loaded_tensor = dequantize(gguf_tensor.data, gguf_tensor.tensor_type).to(
-                device
+            gguf_tensor, dtype = GLOBAL_GGUF_MAPPING[key]
+            # loaded_tensor = dequantize(gguf_tensor.data, gguf_tensor.tensor_type).to(
+            #     device, non_blocking=True
+            # )
+            loaded_tensor = dequantize(gguf_tensor, dtype).to(
+                device, non_blocking=True
             )
         # Split the full_name into its components (e.g. "submodule.weight" -> ["submodule", "weight"])
         name_parts = full_name.split(".")
