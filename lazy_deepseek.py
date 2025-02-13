@@ -57,6 +57,7 @@ for i in range(1, 4):
             torch.from_numpy(tensor.data),
             tensor.tensor_type,
         )
+        # pin memory could help with performance, though it does not work on my 3090
 # Initialize the model with empty weights.
 init_contexts = [no_init_weights(_enable=True), init_empty_weights()]
 with ContextManagers(init_contexts):
@@ -93,14 +94,18 @@ with torch.no_grad():
     past_key_value = DynamicCache()
     output_attentions = False
     use_cache = True
+    flag = True
     start = timer()
-    for i in range(50):
+    for i in range(51):
         out = model(
             input_ids,
             past_key_values=past_key_value,
             output_attentions=output_attentions,
             use_cache=use_cache,
         )
+        if flag:
+            flag = False
+            st = timer()
         x = out.last_hidden_state
         past_key_value = out.past_key_values
         # x = model.norm(x)
@@ -111,35 +116,30 @@ with torch.no_grad():
         seq_length = 1  # new token
         print(i, timer() - start)
         start = timer()
-# start = timer()
-# with torch.no_grad():
-#     for i in range(5):
-#         batch_size, seq_length = 1, 128
-#         input_ids = torch.randint(0, 129280, (batch_size, seq_length)).cuda()
-#         x = model.embed_tokens(input_ids)
-#         cache_position = torch.arange(0, x.shape[1], device=x.device)
-#         position_ids = cache_position.unsqueeze(0)
-#         # attention_mask = _prepare_4d_causal_attention_mask(
-#         #     None, (batch_size, seq_length), x, 0
-#         # )
-#         past_key_value = DynamicCache()
-#         output_attentions = False
-#         use_cache = True
-#         x, cache = pipelined_inference_layers(
-#             model.layers,
-#             x,
-#             chunk_size=4,
-#             # attention_mask=attention_mask,
-#             position_ids=position_ids,
-#             past_key_value=past_key_value,
-#             output_attentions=output_attentions,
-#             use_cache=use_cache,
-#         )
-#         x = model.norm(x)
-#         x = model.lm_head(x)
-#         print(
-#             f"Finished {i + 1} inference, GPU memory: {torch.cuda.memory_allocated() / 1e9:.2f} GB, time: {timer() - start:.2f}"
-#         )
-# torch.cuda.synchronize()
-# end = timer()
-# print("Average time per inference:", (end - start) / 5)
+    print("Decoding time:", (timer() - st) / 50)
+
+start = timer()
+with torch.no_grad():
+    for i in range(5):
+        batch_size, seq_length = 1, 128
+        input_ids = torch.randint(0, 129280, (batch_size, seq_length)).cuda()
+        out = model(
+            input_ids,
+            # past_key_values=past_key_value,
+            output_attentions=output_attentions,
+            use_cache=False
+        )
+        if flag:
+            flag = False
+            st = timer()
+        x = out.last_hidden_state
+        # past_key_value = out.past_key_values
+        # x = model.norm(x)
+        logits = model.lm_head(x)
+        print(
+            f"Finished {i + 1} inference, GPU memory: {torch.cuda.memory_allocated() / 1e9:.2f} GB, time: {timer() - start:.2f}"
+        )
+        # torch.cuda.empty_cache()
+torch.cuda.synchronize()
+end = timer()
+print("Average time per inference:", (end - start) / 5)

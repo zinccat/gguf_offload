@@ -42,7 +42,7 @@ def _apply_over_grouped_rows(func, arr, otype, oshape) -> torch.Tensor:
     This version does not split the input into groups but runs the entire operation at once.
     """
     # Convert the input array to a GPU tensor and flatten all but the last dimension.
-    rows = torch.from_numpy(arr).to("cuda", non_blocking=True).view(-1, arr.shape[-1])
+    rows = arr.to("cuda", non_blocking=True).view(-1, arr.shape[-1])
 
     # Apply the function to the entire tensor.
     out = func(rows)
@@ -83,11 +83,9 @@ def dequantize(
     data: np.ndarray, qtype: GGMLQuantizationType
 ) -> torch.Tensor:
     if qtype == GGMLQuantizationType.F32:
-        # return data.view(np.float32)
-        return torch.from_numpy(data).to("cuda", non_blocking=True).to(torch.float16)
+        return data.to("cuda", non_blocking=True).to(torch.float16)
     elif qtype == GGMLQuantizationType.F16:
-        # return data.view(np.float16).astype(np.float32)
-        return torch.from_numpy(data.view(np.float16))  # .to(torch.float16)
+        return data.to("cuda", non_blocking=True).to(torch.float16)
     elif (q := _type_traits.get(qtype)) is not None:
         return q.dequantize(data)  # .float()
     else:
@@ -496,34 +494,70 @@ class Q8_0(__Quant, qtype=GGMLQuantizationType.Q8_0):
 
         return x * d
 
-
 class Q2_K(__Quant, qtype=GGMLQuantizationType.Q2_K):
     @classmethod
-    def dequantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:
-        n_blocks = blocks.shape[0]
+    def dequantize_blocks(cls, blocks: torch.Tensor) -> torch.Tensor:
+        """
+        Expects a tensor `blocks` of dtype torch.uint8 and shape (n_blocks, TOTAL_BYTES),
+        where TOTAL_BYTES for Q2_K is 88 (based on your original code logic).
+        """
+        n_blocks = blocks.size(0)
 
-        scales, rest = np.hsplit(blocks, [QK_K // 16])
-        qs, rest = np.hsplit(rest, [QK_K // 4])
-        d, dmin = np.hsplit(rest, [2])
+        # Split the blocks: first 2 bytes for d, next 2 bytes for dmin, then scales and qs
+        scales, rest = blocks.split([QK_K // 16, blocks.size(1) - QK_K // 16], dim=1)
+        # qs, rest = rest.split(QK_K // 4, dim=1)
+        qs, rest = rest.split([QK_K // 4, rest.size(1) - QK_K // 4], dim=1)
+        # d, dmin = rest.split(2, dim=1)
+        d, dmin = rest.split([2, rest.size(1) - 2], dim=1)
 
-        d = d.view(np.float16).astype(np.float32)
-        dmin = dmin.view(np.float16).astype(np.float32)
+        # Reinterpret the first two bytes as float16 and convert to float32.
+        d = d.view(torch.float16).to(torch.float32)
+        dmin = dmin.view(torch.float16).to(torch.float32)
 
-        # (n_blocks, 16, 1)
-        dl = (d * (scales & 0xF).astype(np.float32)).reshape((n_blocks, QK_K // 16, 1))
-        ml = (dmin * (scales >> 4).astype(np.float32)).reshape(
-            (n_blocks, QK_K // 16, 1)
-        )
+        # (n_blocks, 16, 1) processing for scales
+        dl = (d * (scales & 0xF).to(torch.float32)).view(n_blocks, QK_K // 16, 1)
+        ml = (dmin * (scales >> 4).to(torch.float32)).view(n_blocks, QK_K // 16, 1)
 
-        shift = np.array([0, 2, 4, 6], dtype=np.uint8).reshape((1, 1, 4, 1))
+        # Shift tensor to prepare for quantization processing
+        shift = torch.tensor([0, 2, 4, 6], dtype=torch.uint8, device=blocks.device).view(1, 1, 4, 1)
 
-        qs = (qs.reshape((n_blocks, -1, 1, 32)) >> shift) & np.uint8(3)
+        qs = (qs.view(n_blocks, -1, 1, 32) >> shift) & 0x03
 
-        qs = qs.reshape((n_blocks, QK_K // 16, 16)).astype(np.float32)
+        # Reshape qs and perform the calculation
+        qs = qs.view(n_blocks, QK_K // 16, 16).to(torch.float32)
 
+        # Final dequantization formula
         qs = dl * qs - ml
 
-        return qs.reshape((n_blocks, -1))
+        return qs.view(n_blocks, -1).to(torch.float16)
+
+# class Q2_K(__Quant, qtype=GGMLQuantizationType.Q2_K):
+#     @classmethod
+#     def dequantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:
+#         n_blocks = blocks.shape[0]
+
+#         scales, rest = np.hsplit(blocks, [QK_K // 16])
+#         qs, rest = np.hsplit(rest, [QK_K // 4])
+#         d, dmin = np.hsplit(rest, [2])
+
+#         d = d.view(np.float16).astype(np.float32)
+#         dmin = dmin.view(np.float16).astype(np.float32)
+
+#         # (n_blocks, 16, 1)
+#         dl = (d * (scales & 0xF).astype(np.float32)).reshape((n_blocks, QK_K // 16, 1))
+#         ml = (dmin * (scales >> 4).astype(np.float32)).reshape(
+#             (n_blocks, QK_K // 16, 1)
+#         )
+
+#         shift = np.array([0, 2, 4, 6], dtype=np.uint8).reshape((1, 1, 4, 1))
+
+#         qs = (qs.reshape((n_blocks, -1, 1, 32)) >> shift) & np.uint8(3)
+
+#         qs = qs.reshape((n_blocks, QK_K // 16, 16)).astype(np.float32)
+
+#         qs = dl * qs - ml
+
+#         return qs.reshape((n_blocks, -1))
 
 
 class Q3_K(__Quant, qtype=GGMLQuantizationType.Q3_K):
@@ -675,16 +709,6 @@ class Q4_K(__Quant, qtype=GGMLQuantizationType.Q4_K):
         return (
             ((qs >> cls.shift) & 0x0F).view(n_blocks, -1, 32).to(torch.float16) * d - dm
         ).view(n_blocks, QK_K)
-        # qs &= 0x0F
-        # qs = qs.view(n_blocks, -1, 32).to(torch.float16)  # shape now (n_blocks, 8, 32)
-
-        # Perform the dequantization: scale the quantized values and subtract the offset.
-        # d (shape (n_blocks, 8, 1)) multiplies qs (shape (n_blocks, 8, 32)) by broadcasting,
-        # and dm is subtracted before finally reshaping to (n_blocks, QK_K)
-        # result = (d * qs - dm).view(n_blocks, QK_K)
-        # qs *= d
-        # qs -= dm
-        # return qs.view(n_blocks, QK_K)
 
 
 class Q5_K(__Quant, qtype=GGMLQuantizationType.Q5_K):
