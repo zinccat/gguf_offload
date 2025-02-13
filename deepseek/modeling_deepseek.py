@@ -57,6 +57,10 @@ from .configuration_deepseek import DeepseekV3Config
 import torch.distributed as dist
 import numpy as np
 
+from lazy_loading import load_experts
+# import llamacpp_cuda
+import register_lib
+
 if is_flash_attn_2_available():
     from flash_attn import flash_attn_func, flash_attn_varlen_func
     from flash_attn.bert_padding import index_first_axis, pad_input, unpad_input  # noqa
@@ -87,6 +91,52 @@ def _get_unpad_data(attention_mask):
         max_seqlen_in_batch,
     )
 
+class Linear(nn.Module):
+    """Quantized linear layer"""
+    __constants__ = ["in_features", "out_features"]
+    in_features: int
+    out_features: int
+    weight: torch.Tensor
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        bias: bool = True,
+        device=None,
+        dtype=None,
+    ) -> None:
+        factory_kwargs = {"device": device, "dtype": dtype}
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.weight = nn.Parameter(
+            torch.empty((out_features, in_features), **factory_kwargs)
+        )
+        if bias:
+            self.bias = nn.Parameter(torch.empty(out_features, **factory_kwargs))
+        else:
+            self.register_parameter("bias", None)
+        self.weight_type = 0
+
+    def forward(self, x):
+        xshape = x.view(-1, x.shape[-1])
+        # xshape = xshape.to(self.weight.device)
+        if self.weight_type < 2:
+            output = xshape @ self.weight.view(self.out_features, self.in_features).T
+        # Force to use dequant for 2-bit model for now
+        elif xshape.shape[0] == 1:
+            output = torch.ops.llama_cpp.ggml_mul_mat_vec_a8(self.weight, xshape, self.weight_type, self.out_features)
+        elif xshape.shape[0] < 8 and self.weight_type < 16:
+            output = torch.ops.llama_cpp.ggml_mul_mat_a8(self.weight, xshape, self.weight_type, self.out_features)
+        else:
+            weight = torch.ops.llama_cpp.ggml_dequantize(self.weight, self.weight_type, self.out_features, self.in_features)
+            output = xshape @ weight.T
+        if self.bias is not None:
+            output = output + self.bias
+        output = output.view(*x.shape[:-1], self.out_features)
+        # print("Linear output shape: ", output.dtype)
+        return output
 
 class DeepseekV3RMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
@@ -377,9 +427,9 @@ class DeepseekV3MLP(nn.Module):
             config.intermediate_size if intermediate_size is None else intermediate_size
         )
 
-        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
+        self.gate_proj = Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.up_proj = Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.down_proj = Linear(self.intermediate_size, self.hidden_size, bias=False)
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x):
@@ -421,9 +471,12 @@ class MoEGate(nn.Module):
         bsz, seq_len, h = hidden_states.shape
         ### compute gating score
         hidden_states = hidden_states.view(-1, h)
+        # print("Gating weight shape: ", self.weight.shape, self.weight.dtype, hidden_states.shape, hidden_states.dtype)
         logits = F.linear(
             hidden_states.type(torch.float32), self.weight.type(torch.float32), None
         )
+        # logits = hidden_states @ self.weight.T
+        # logits = torch.ops.llama_cpp.ggml_mul_mat_a8(self.weight, hidden_states, 0, self.n_routed_experts)
         if self.scoring_func == "sigmoid":
             scores = logits.sigmoid()
         else:
@@ -470,15 +523,27 @@ class MoEGate(nn.Module):
 
         return topk_idx, topk_weight
 
+# from concurrent.futures import ThreadPoolExecutor
+
+# def process_tokens_for_expert(i, start_idx, end_idx, sorted_tokens, experts):
+#     # Fetch the correct expert based on index
+#     expert = experts[i]
+#     # Slice the tokens for this expert
+#     tokens_for_this_expert = sorted_tokens[start_idx:end_idx]
+#     # Process tokens using the expert
+#     expert_out = expert(tokens_for_this_expert)
+#     return expert_out
+
 class DeepseekV3MoE(nn.Module):
     """
     A mixed expert module containing shared experts.
     """
 
-    def __init__(self, config):
+    def __init__(self, config, layer_idx=None):
         super().__init__()
         self.config = config
         self.num_experts_per_tok = config.num_experts_per_tok
+        self.layer_idx = layer_idx
 
         if hasattr(config, "ep_size") and config.ep_size > 1:
             assert config.ep_size == dist.get_world_size()
@@ -522,7 +587,7 @@ class DeepseekV3MoE(nn.Module):
         orig_shape = hidden_states.shape
         topk_idx, topk_weight = self.gate(hidden_states)
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
-        flat_topk_idx = topk_idx.view(-1)
+        # flat_topk_idx = topk_idx.view(-1)
         if not self.training:
             y = self.moe_infer(hidden_states, topk_idx, topk_weight).view(*orig_shape)
         if self.config.n_shared_experts is not None:
@@ -569,10 +634,14 @@ class DeepseekV3MoE(nn.Module):
             gatherd_idxs = gatherd_idxs.argsort()
             sorted_tokens = gathered_tokens[gatherd_idxs]
             tokens_per_expert = tokens_per_expert_post_gather
-        tokens_per_expert = tokens_per_expert.cpu().numpy()
-
+        tokens_per_expert = tokens_per_expert.tolist()
+        # from timeit import default_timer as timer
+        # start = timer()
         outputs = []
         start_idx = 0
+        # experts_to_use = [i for i in range(len(self.experts)) if tokens_per_expert[i] > 0]
+        # if len(experts_to_use) < 10:
+        #     load_experts(self.experts, self.layer_idx, experts_to_use)
         for i, num_tokens in enumerate(tokens_per_expert):
             end_idx = start_idx + num_tokens
             if num_tokens == 0:
@@ -582,8 +651,32 @@ class DeepseekV3MoE(nn.Module):
             expert_out = expert(tokens_for_this_expert)
             outputs.append(expert_out)
             start_idx = end_idx
-
+        
         outs = torch.cat(outputs, dim=0) if len(outputs) else sorted_tokens.new_empty(0)
+        # outputs = []
+        # start_idx = 0
+        # # Set up the thread pool executor
+        # with ThreadPoolExecutor() as executor:
+        #     futures = []
+        #     for i, num_tokens in enumerate(tokens_per_expert):
+        #         end_idx = start_idx + num_tokens
+        #         if num_tokens == 0:
+        #             continue
+        #         # Assign task to the thread pool
+        #         futures.append(executor.submit(process_tokens_for_expert, 
+        #                                     i + self.ep_rank * self.experts_per_rank, 
+        #                                     start_idx, end_idx, 
+        #                                     sorted_tokens, 
+        #                                     self.experts))
+        #         start_idx = end_idx
+            
+        #     # Collect the results from each future (maintaining order)
+        #     for future in futures:
+        #         outputs.append(future.result())
+        
+        # # Concatenate the results if outputs are not empty
+        # outs = torch.cat(outputs, dim=0) if len(outputs) else sorted_tokens.new_empty(0)
+        # print(outs)
         if self.ep_size > 1:
             new_x = torch.empty_like(outs)
             new_x[gatherd_idxs] = outs
@@ -652,32 +745,32 @@ class DeepseekV3Attention(nn.Module):
         self.is_causal = True
 
         if self.q_lora_rank is None:
-            self.q_proj = nn.Linear(
+            self.q_proj = Linear(
                 self.hidden_size, self.num_heads * self.q_head_dim, bias=False
             )
         else:
-            self.q_a_proj = nn.Linear(
+            self.q_a_proj = Linear(
                 self.hidden_size, config.q_lora_rank, bias=config.attention_bias
             )
             self.q_a_layernorm = DeepseekV3RMSNorm(config.q_lora_rank)
-            self.q_b_proj = nn.Linear(
+            self.q_b_proj = Linear(
                 config.q_lora_rank, self.num_heads * self.q_head_dim, bias=False
             )
 
-        self.kv_a_proj_with_mqa = nn.Linear(
+        self.kv_a_proj_with_mqa = Linear(
             self.hidden_size,
             config.kv_lora_rank + config.qk_rope_head_dim,
             bias=config.attention_bias,
         )
         self.kv_a_layernorm = DeepseekV3RMSNorm(config.kv_lora_rank)
-        self.kv_b_proj = nn.Linear(
+        self.kv_b_proj = Linear(
             config.kv_lora_rank,
             self.num_heads
             * (self.q_head_dim - self.qk_rope_head_dim + self.v_head_dim),
             bias=False,
         )
 
-        self.o_proj = nn.Linear(
+        self.o_proj = Linear(
             self.num_heads * self.v_head_dim,
             self.hidden_size,
             bias=config.attention_bias,
@@ -1147,7 +1240,7 @@ class DeepseekV3DecoderLayer(nn.Module):
         )
 
         self.mlp = (
-            DeepseekV3MoE(config)
+            DeepseekV3MoE(config, layer_idx)
             if (
                 config.n_routed_experts is not None
                 and layer_idx >= config.first_k_dense_replace
@@ -1257,7 +1350,7 @@ class DeepseekV3PreTrainedModel(PreTrainedModel):
 
     def _init_weights(self, module):
         std = self.config.initializer_range
-        if isinstance(module, nn.Linear):
+        if isinstance(module, Linear):
             module.weight.data.normal_(mean=0.0, std=std)
             if module.bias is not None:
                 module.bias.data.zero_()
@@ -1516,7 +1609,7 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel):
         super().__init__(config)
         self.model = DeepseekV3Model(config)
         self.vocab_size = config.vocab_size
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False)
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -1734,7 +1827,7 @@ class DeepseekV3ForSequenceClassification(DeepseekV3PreTrainedModel):
         super().__init__(config)
         self.num_labels = config.num_labels
         self.model = DeepseekV3Model(config)
-        self.score = nn.Linear(config.hidden_size, self.num_labels, bias=False)
+        self.score = Linear(config.hidden_size, self.num_labels, bias=False)
 
         # Initialize weights and apply final processing
         self.post_init()

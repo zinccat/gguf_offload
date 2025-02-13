@@ -1,5 +1,6 @@
 import re
 import torch
+from typing import Optional, Tuple
 from gguf import MODEL_ARCH_NAMES, get_tensor_name_map
 from gguf_gpu import dequantize
 
@@ -41,47 +42,77 @@ def get_gguf_hf_weights_map(hf_model, model_type=None, num_layers=None, qual_nam
         name = "model." + name  # required for name map lookup
         gguf_name = name_map.get_name(name)
         if gguf_name is None:
-            print(f"Skipping {name} -> {hf_name}")
+            # print(f"Skipping {name} -> {hf_name}")
             continue
         gguf_to_hf_name_map[gguf_name + suffix] = qual_name + hf_name
     return gguf_to_hf_name_map
 
 
 def lazy_load_hook(module, inputs):
-    input0 = inputs[0]
-    if isinstance(input0, (tuple, list)):
-        input0 = input0[0]
-    device = input0.device
-
     for attr, hf_key in getattr(module, "lazy_params", {}).items():
+        if getattr(module, attr) is not None:
+            return
         expert_idx = None
-        hf_key = hf_key.replace("model.", "")
         param = getattr(module, attr)
         if param is None or (hasattr(param, "device") and param.device.type == "meta"):
-            if "experts" in hf_key and "shared_experts" not in hf_key:
-                # Use regex to match the expert index part of the key
-                match = re.search(r"mlp.experts.(\d+)", hf_key)
-                if match:
-                    expert_idx = int(match.group(1))  # Get the expert index
-                    hf_key = re.sub(
-                        r"mlp.experts.(\d+)", "mlp.experts", hf_key
-                    )  # Normalize the key
-                else:
-                    expert_idx = None  # If no expert index is present, set to None
-            if hf_key.endswith("e_score_correction_bias"):
+            if "mlp.experts" in hf_key:
+                expert_idx = int(hf_key.split(".")[4])
+                hf_key = re.sub(r"mlp.experts.\d+.", "mlp.experts.", hf_key)
+            else:
+                setattr(module, "lazy_params", {})
+                # remove hook
                 hf_key = hf_key.replace(
                     "e_score_correction_bias", "e_score_correction.bias"
                 )
-            # if hf_key.endswith("e_score_correction_bias"):
-            #     param_tensor = torch.empty((module.n_routed_experts))
-            if hf_key not in GLOBAL_GGUF_MAPPING:
-                raise ValueError(f"GGUF mapping does not contain key: {hf_key}")
+            gguf_tensor, dtype = GLOBAL_GGUF_MAPPING[hf_key]
+            if expert_idx is not None:
+                # print(gguf_tensor[expert_idx].shape, hf_key)
+                # gguf_tensor[expert_idx].pin_memory()
+                setattr(
+                    module,
+                    attr,
+                    gguf_tensor[expert_idx].to("cuda", non_blocking=True),
+                )
             else:
-                gguf_tensor = GLOBAL_GGUF_MAPPING[hf_key]
-            param_tensor = dequantize(
-                gguf_tensor.data, gguf_tensor.tensor_type, expert_idx
-            )
-            setattr(module, attr, param_tensor.to(device))
+                setattr(module, attr, gguf_tensor.to("cuda", non_blocking=True))
+            setattr(module, "weight_type", int(dtype))
+
+
+def load_experts(experts, layer_idx, experts_idx):
+    keys = ["up_proj.weight", "down_proj.weight", "gate_proj.weight"]
+    for key in keys:
+        hf_key = f"layers.{layer_idx}.mlp.experts.{key}"
+        # if hf_key not in GLOBAL_GGUF_MAPPING:
+        #     raise ValueError(f"GGUF mapping does not contain key: {hf_key}")
+        gguf_tensor, dtype = GLOBAL_GGUF_MAPPING[hf_key]
+        # param_tensor = dequantize(
+        #     gguf_tensor.data, gguf_tensor.tensor_type, experts_idx
+        # )
+        # setattr(experts, key, param_tensor)
+        for i, idx in enumerate(experts_idx):
+            setattr(experts[idx], key, gguf_tensor[i].to("cuda", non_blocking=True))
+            setattr(experts[idx], "weight_type", int(dtype))
+
+def load_single_expert(experts, layer_idx, expert_idx):
+    # torch.Size([2048, 1400]) layers.14.mlp.experts.gate_proj.weight                                                     
+    # torch.Size([2048, 1400]) layers.14.mlp.experts.up_proj.weight                                                       
+    # torch.Size([7168, 528]) layers.14.mlp.experts.down_proj.weight
+    keys = ["gate_proj", "up_proj", "down_proj"]
+    gguf_tensor = []
+    for key in keys:
+        hf_key = f"layers.{layer_idx}.mlp.experts.{key}.weight"
+        tensor, dtype = GLOBAL_GGUF_MAPPING[hf_key]
+        # print(tensor.shape, hf_key)
+        if key == "down_proj":
+            gguf_tensor.append(tensor[expert_idx].reshape(2048, -1))
+        else:
+            gguf_tensor.append(tensor[expert_idx])
+        setattr(getattr(experts[expert_idx], key), "weight_type", int(dtype))
+    gguf_tensor = torch.cat(gguf_tensor, dim=1).to("cuda") #, non_blocking=True)
+    setattr(experts[expert_idx], "gate_proj.weight", gguf_tensor[:, :1400])
+    setattr(experts[expert_idx], "up_proj.weight", gguf_tensor[:, 1400:2800])
+    setattr(experts[expert_idx], "down_proj.weight", gguf_tensor[:, 2800:].reshape(7168, -1))
+    gguf_tensor = None
 
 
 def lazy_offload_hook(module, inputs, output):
@@ -101,16 +132,26 @@ def remove_registered_parameters(model):
     # Do not remove parameters from these modules.
     skip_modules = {"embed_tokens", "rotary_emb", "norm"}
     for full_name, _ in list(model.named_parameters()):
+        module = get_module_by_name(model, full_name)
         if full_name.split(".")[0] in skip_modules:
+            # setattr(module, "load_once", True)
             continue
         if full_name.split(".")[0] == "layers" and int(full_name.split(".")[1]) < 3:
             # Skip the first 3 Dense layers
-            continue
-        module = get_module_by_name(model, full_name)
+            setattr(module, "load_once", True)
+        elif (
+            "shared_experts" in full_name
+            or "mlp.gate" in full_name
+            or "norm" in full_name
+            or "self_attn" in full_name
+        ):
+            setattr(module, "load_once", True)
+        elif "experts" not in full_name:
+            print(f"Lazy loading {full_name}")
         attr = full_name.split(".")[-1]
         if not hasattr(module, "lazy_params"):
             module.lazy_params = {}
-        module.lazy_params[attr] = full_name
+        module.lazy_params[attr] = full_name.replace("model.", "")
         if attr in module._parameters:
             del module._parameters[attr]
         setattr(module, attr, None)
@@ -129,10 +170,11 @@ def load_eager_module_weights(module, full_prefix, device="cuda"):
             if key not in GLOBAL_GGUF_MAPPING:
                 raise ValueError(f"GGUF mapping does not contain key: {key}")
 
-            gguf_tensor = GLOBAL_GGUF_MAPPING[key]
-            loaded_tensor = dequantize(gguf_tensor.data, gguf_tensor.tensor_type).to(
-                device
-            )
+            gguf_tensor, dtype = GLOBAL_GGUF_MAPPING[key]
+            # loaded_tensor = dequantize(gguf_tensor.data, gguf_tensor.tensor_type).to(
+            #     device, non_blocking=True
+            # )
+            loaded_tensor = dequantize(gguf_tensor, dtype).to(device, non_blocking=True)
         # Split the full_name into its components (e.g. "submodule.weight" -> ["submodule", "weight"])
         name_parts = full_name.split(".")
         # Traverse the module hierarchy to get to the correct submodule
@@ -143,3 +185,34 @@ def load_eager_module_weights(module, full_prefix, device="cuda"):
         param_name = name_parts[-1]
         # Replace (or register) the parameter in the found submodule
         submodule.register_parameter(param_name, torch.nn.Parameter(loaded_tensor))
+
+
+def pipelined_inference_layers(
+    layers,
+    hidden_states: torch.Tensor,
+    attention_mask: Optional[torch.Tensor] = None,
+    position_ids: Optional[torch.LongTensor] = None,
+    past_key_value: Optional[Tuple[torch.Tensor]] = None,
+    output_attentions: Optional[bool] = False,
+    use_cache: Optional[bool] = False,
+    **kwargs,
+) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
+    y = hidden_states
+
+    for layer in layers:
+        layer_output = layer(
+            hidden_states=y,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_value=past_key_value,
+            output_attentions=output_attentions,
+            use_cache=use_cache,
+            **kwargs,
+        )
+        y = layer_output[0]
+
+    if use_cache:
+        return y, layer_output[1]
+
+    # torch.cuda.empty_cache()
+    return y
