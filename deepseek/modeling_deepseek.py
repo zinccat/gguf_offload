@@ -55,10 +55,6 @@ from transformers.utils import (
 from transformers.utils.import_utils import is_torch_fx_available
 from .configuration_deepseek import DeepseekV3Config
 import torch.distributed as dist
-import numpy as np
-
-from lazy_loading import load_experts
-# import llamacpp_cuda
 import register_lib
 
 if is_flash_attn_2_available():
@@ -121,7 +117,6 @@ class Linear(nn.Module):
 
     def forward(self, x):
         xshape = x.view(-1, x.shape[-1])
-        # xshape = xshape.to(self.weight.device)
         if self.weight_type < 2:
             output = xshape @ self.weight.view(self.out_features, self.in_features).T
         # Force to use dequant for 2-bit model for now
@@ -135,7 +130,6 @@ class Linear(nn.Module):
         if self.bias is not None:
             output = output + self.bias
         output = output.view(*x.shape[:-1], self.out_features)
-        # print("Linear output shape: ", output.dtype)
         return output
 
 class DeepseekV3RMSNorm(nn.Module):
@@ -152,8 +146,10 @@ class DeepseekV3RMSNorm(nn.Module):
         hidden_states = hidden_states.to(torch.float32)
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
         hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-        return self.weight * hidden_states.to(input_dtype)
+        # return self.weight * hidden_states.to(input_dtype)
+        return (self.weight * hidden_states).to(input_dtype)
 
+# from fused_rms_norm import FusedRMSNorm as DeepseekV3RMSNorm
 
 ALL_LAYERNORM_LAYERS.append(DeepseekV3RMSNorm)
 
@@ -473,7 +469,7 @@ class MoEGate(nn.Module):
         hidden_states = hidden_states.view(-1, h)
         # print("Gating weight shape: ", self.weight.shape, self.weight.dtype, hidden_states.shape, hidden_states.dtype)
         logits = F.linear(
-            hidden_states.type(torch.float32), self.weight.type(torch.float32), None
+            hidden_states.type(torch.float32), self.weight, None
         )
         # logits = hidden_states @ self.weight.T
         # logits = torch.ops.llama_cpp.ggml_mul_mat_a8(self.weight, hidden_states, 0, self.n_routed_experts)
@@ -522,17 +518,6 @@ class MoEGate(nn.Module):
         topk_weight = topk_weight * self.routed_scaling_factor # must multiply the scaling factor
 
         return topk_idx, topk_weight
-
-# from concurrent.futures import ThreadPoolExecutor
-
-# def process_tokens_for_expert(i, start_idx, end_idx, sorted_tokens, experts):
-#     # Fetch the correct expert based on index
-#     expert = experts[i]
-#     # Slice the tokens for this expert
-#     tokens_for_this_expert = sorted_tokens[start_idx:end_idx]
-#     # Process tokens using the expert
-#     expert_out = expert(tokens_for_this_expert)
-#     return expert_out
 
 class DeepseekV3MoE(nn.Module):
     """
@@ -591,8 +576,9 @@ class DeepseekV3MoE(nn.Module):
         if not self.training:
             y = self.moe_infer(hidden_states, topk_idx, topk_weight).view(*orig_shape)
         if self.config.n_shared_experts is not None:
-            y = y + self.shared_experts(identity)
-        return y
+            z = self.shared_experts(identity)
+
+        return y + z
 
     @torch.no_grad()
     def moe_infer(self, x, topk_ids, topk_weight):
@@ -601,44 +587,46 @@ class DeepseekV3MoE(nn.Module):
         tokens_per_expert = cnts.sum(dim=0)
         idxs = topk_ids.view(-1).argsort()
         sorted_tokens = x[idxs // topk_ids.shape[1]]
-        sorted_tokens_shape = sorted_tokens.shape
-        if self.ep_size > 1:
-            tokens_per_ep_rank = tokens_per_expert.view(self.ep_size, -1).sum(dim=1)
-            tokens_per_expert_group = tokens_per_expert.new_empty(
-                tokens_per_expert.shape[0]
-            )
-            dist.all_to_all_single(tokens_per_expert_group, tokens_per_expert)
-            output_splits = (
-                tokens_per_expert_group.view(self.ep_size, -1)
-                .sum(1)
-                .cpu()
-                .numpy()
-                .tolist()
-            )
-            gathered_tokens = sorted_tokens.new_empty(
-                tokens_per_expert_group.sum(dim=0).cpu().item(), sorted_tokens.shape[1]
-            )
-            input_split_sizes = tokens_per_ep_rank.cpu().numpy().tolist()
-            dist.all_to_all(
-                list(gathered_tokens.split(output_splits)),
-                list(sorted_tokens.split(input_split_sizes)),
-            )
-            tokens_per_expert_post_gather = tokens_per_expert_group.view(
-                self.ep_size, self.experts_per_rank
-            ).sum(dim=0)
-            gatherd_idxs = np.zeros(shape=(gathered_tokens.shape[0],), dtype=np.int32)
-            s = 0
-            for i, k in enumerate(tokens_per_expert_group.cpu().numpy()):
-                gatherd_idxs[s : s + k] = i % self.experts_per_rank
-                s += k
-            gatherd_idxs = gatherd_idxs.argsort()
-            sorted_tokens = gathered_tokens[gatherd_idxs]
-            tokens_per_expert = tokens_per_expert_post_gather
+        # sorted_tokens_shape = sorted_tokens.shape
+        # if self.ep_size > 1:
+        #     tokens_per_ep_rank = tokens_per_expert.view(self.ep_size, -1).sum(dim=1)
+        #     tokens_per_expert_group = tokens_per_expert.new_empty(
+        #         tokens_per_expert.shape[0]
+        #     )
+        #     dist.all_to_all_single(tokens_per_expert_group, tokens_per_expert)
+        #     output_splits = (
+        #         tokens_per_expert_group.view(self.ep_size, -1)
+        #         .sum(1)
+        #         .cpu()
+        #         .numpy()
+        #         .tolist()
+        #     )
+        #     gathered_tokens = sorted_tokens.new_empty(
+        #         tokens_per_expert_group.sum(dim=0).cpu().item(), sorted_tokens.shape[1]
+        #     )
+        #     input_split_sizes = tokens_per_ep_rank.cpu().numpy().tolist()
+        #     dist.all_to_all(
+        #         list(gathered_tokens.split(output_splits)),
+        #         list(sorted_tokens.split(input_split_sizes)),
+        #     )
+        #     tokens_per_expert_post_gather = tokens_per_expert_group.view(
+        #         self.ep_size, self.experts_per_rank
+        #     ).sum(dim=0)
+        #     gatherd_idxs = np.zeros(shape=(gathered_tokens.shape[0],), dtype=np.int32)
+        #     s = 0
+        #     for i, k in enumerate(tokens_per_expert_group.cpu().numpy()):
+        #         gatherd_idxs[s : s + k] = i % self.experts_per_rank
+        #         s += k
+        #     gatherd_idxs = gatherd_idxs.argsort()
+        #     sorted_tokens = gathered_tokens[gatherd_idxs]
+        #     tokens_per_expert = tokens_per_expert_post_gather
+        
         tokens_per_expert = tokens_per_expert.tolist()
         # from timeit import default_timer as timer
         # start = timer()
         outputs = []
         start_idx = 0
+
         # experts_to_use = [i for i in range(len(self.experts)) if tokens_per_expert[i] > 0]
         # if len(experts_to_use) < 10:
         #     load_experts(self.experts, self.layer_idx, experts_to_use)
@@ -646,46 +634,65 @@ class DeepseekV3MoE(nn.Module):
             end_idx = start_idx + num_tokens
             if num_tokens == 0:
                 continue
-            expert = self.experts[i + self.ep_rank * self.experts_per_rank]
-            tokens_for_this_expert = sorted_tokens[start_idx:end_idx]
-            expert_out = expert(tokens_for_this_expert)
+            expert_out = self.experts[i + self.ep_rank * self.experts_per_rank](sorted_tokens[start_idx:end_idx])
             outputs.append(expert_out)
             start_idx = end_idx
         
         outs = torch.cat(outputs, dim=0) if len(outputs) else sorted_tokens.new_empty(0)
+
+        # torch.cuda.synchronize()
+        # print("Time taken: ", timer() - start)
+
         # outputs = []
         # start_idx = 0
-        # # Set up the thread pool executor
-        # with ThreadPoolExecutor() as executor:
-        #     futures = []
-        #     for i, num_tokens in enumerate(tokens_per_expert):
-        #         end_idx = start_idx + num_tokens
-        #         if num_tokens == 0:
-        #             continue
-        #         # Assign task to the thread pool
-        #         futures.append(executor.submit(process_tokens_for_expert, 
-        #                                     i + self.ep_rank * self.experts_per_rank, 
-        #                                     start_idx, end_idx, 
-        #                                     sorted_tokens, 
-        #                                     self.experts))
-        #         start_idx = end_idx
+        # streams = []
+
+        # # Create one CUDA stream for each expert
+        # for i, num_tokens in enumerate(tokens_per_expert):
+        #     end_idx = start_idx + num_tokens
+        #     if num_tokens == 0:
+        #         continue
             
-        #     # Collect the results from each future (maintaining order)
-        #     for future in futures:
-        #         outputs.append(future.result())
+        #     # Get the expert model
+        #     expert_ = self.experts[i + self.ep_rank * self.experts_per_rank]
+            
+        #     # Select the tokens for this expert
+        #     tokens_for_this_expert = sorted_tokens[start_idx:end_idx]
+        #     # print("Tokens for this expert: ", tokens_for_this_expert.shape)
+            
+        #     # Create a new CUDA stream for asynchronous execution
+        #     stream = torch.cuda.Stream(priority=-i)
+            
+        #     # Asynchronous execution on the given stream
+        #     with torch.cuda.stream(stream):
+        #         expert_out = expert_(tokens_for_this_expert)
+            
+        #     # Append the stream and result pair to outputs to synchronize later
+        #     streams.append(stream)
+        #     outputs.append((expert_out, stream))
+            
+        #     # Update start_idx
+        #     start_idx = end_idx
+
+        # # Now, synchronize all streams to ensure the outputs are ready
+        # final_outputs = []
+        # for output, stream in outputs:
+        #     # Synchronize each stream to ensure the order of operations
+        #     stream.synchronize()
+        #     final_outputs.append(output)  # Move output back to CPU after computation
+
+        # # Concatenate all the outputs while maintaining the order
+        # outs = torch.cat(final_outputs, dim=0) if final_outputs else sorted_tokens.new_empty(0)
         
-        # # Concatenate the results if outputs are not empty
-        # outs = torch.cat(outputs, dim=0) if len(outputs) else sorted_tokens.new_empty(0)
-        # print(outs)
-        if self.ep_size > 1:
-            new_x = torch.empty_like(outs)
-            new_x[gatherd_idxs] = outs
-            gathered_tokens = new_x.new_empty(*sorted_tokens_shape)
-            dist.all_to_all(
-                list(gathered_tokens.split(input_split_sizes)),
-                list(new_x.split(output_splits)),
-            )
-            outs = gathered_tokens
+        # if self.ep_size > 1:
+        #     new_x = torch.empty_like(outs)
+        #     new_x[gatherd_idxs] = outs
+        #     gathered_tokens = new_x.new_empty(*sorted_tokens_shape)
+        #     dist.all_to_all(
+        #         list(gathered_tokens.split(input_split_sizes)),
+        #         list(new_x.split(output_splits)),
+        #     )
+        #     outs = gathered_tokens
 
         new_x = torch.empty_like(outs)
         new_x[idxs] = outs
