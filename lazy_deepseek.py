@@ -4,8 +4,6 @@ from timeit import default_timer as timer
 from transformers import PretrainedConfig
 from transformers.modeling_utils import no_init_weights, init_empty_weights
 from transformers.utils import ContextManagers, logging
-from transformers.modeling_attn_mask_utils import _prepare_4d_causal_attention_mask
-from transformers.utils.import_utils import is_torch_fx_available
 from transformers.cache_utils import DynamicCache
 
 from deepseek.modeling_deepseek import DeepseekV3Model
@@ -18,23 +16,20 @@ from lazy_loading import (
     GLOBAL_GGUF_MAPPING,
     GLOBAL_GGUF_READER,
     lazy_load_hook,
-    lazy_offload_hook,
-    pipelined_inference_layers
+    lazy_offload_hook
 )
 
 
 torch.manual_seed(0)
-logger = logging.get_logger(__name__)
-torch.set_grad_enabled(False)
-torch.backends.cudnn.benchmark = True
+# logger = logging.get_logger(__name__)
+# torch.set_grad_enabled(False)
+# torch.backends.cudnn.benchmark = True
 torch.set_default_dtype(torch.float16)
+# torch.set_num_threads(12)
 # torch.cuda.set_per_process_memory_fraction(0.4)
 # use tf32
 # torch.backends.cuda.matmul.allow_tf32 = True
 # torch.backends.cudnn.allow_tf32 = True
-
-if is_torch_fx_available():
-    _prepare_4d_causal_attention_mask = torch.fx.wrap(_prepare_4d_causal_attention_mask)
 
 # Load model configuration and create a dummy model (on "meta") for weight mapping.
 pretrained_model_name_or_path = "deepseek-ai/DeepSeek-R1"
@@ -48,8 +43,8 @@ tensor_key_mapping = get_gguf_hf_weights_map(dummy_model)
 # Load GGUF files and update the global mapping.
 for i in range(1, 4):
     gguf_path = f"../DeepSeek-R1-GGUF/DeepSeek-R1-UD-IQ1_S/DeepSeek-R1-UD-IQ1_S-0000{i}-of-00003.gguf"
-    # for i in range(1, 6):
-    #     gguf_path = f"../DeepSeek-R1-GGUF/DeepSeek-R1-Q2_K_XS/DeepSeek-R1-Q2_K_XS-0000{i}-of-00005.gguf"
+# for i in range(1, 6):
+#     gguf_path = f"../DeepSeek-R1-GGUF/DeepSeek-R1-Q2_K_XS/DeepSeek-R1-Q2_K_XS-0000{i}-of-00005.gguf"
     GLOBAL_GGUF_READER = GGUFReader(gguf_path)
     # if i == 1:
     #     GGUFReader.data = np.array(GLOBAL_GGUF_READER.data)
@@ -71,13 +66,13 @@ with ContextManagers(init_contexts):
 remove_registered_parameters(model)
 for module in model.modules():
     if getattr(module, "load_once", False):
-        # module.load_once = False
         module.register_forward_pre_hook(lazy_load_hook)
     elif hasattr(module, "lazy_params"):
         module.register_forward_pre_hook(lazy_load_hook)
         module.register_forward_hook(lazy_offload_hook)
 
-model = torch.compile(model)
+# model = torch.compile(model)
+# model = torch.compile(model, fullgraph=True)
 model.eval()
 
 # Eagerly load weights for modules that should always remain on GPU.
@@ -91,46 +86,24 @@ model.lm_head = torch.nn.Linear(config.hidden_size, config.vocab_size, bias=Fals
 model.lm_head.weight = model.embed_tokens.weight
 # model.lm_head.to("cuda")
 
-# model = torch.compile(model)
-
 # --- Inference Example ---
 with torch.no_grad():
-    batch_size, seq_length = 1, 64
+    batch_size, seq_length = 1, 128
     input_ids = torch.randint(0, 129280, (batch_size, seq_length)).cuda()
     past_key_value = DynamicCache()
     output_attentions = False
     use_cache = True
-    past_key_values_length = 0
     start = timer()
     for i in range(50):
-        inputs_embeds = model.embed_tokens(input_ids).half()
-        if use_cache:
-            past_key_values_length = past_key_value.get_usable_length(seq_length)
-        attention_mask = _prepare_4d_causal_attention_mask(
-            None, (batch_size, seq_length), inputs_embeds, past_key_values_length
-        )
-        if attention_mask is None:
-            attention_mask = torch.ones(
-                (batch_size, 1, seq_length, seq_length + past_key_values_length),
-                device=inputs_embeds.device,
-            )
-        position_ids = torch.arange(
-            past_key_values_length,
-            seq_length + past_key_values_length,
-            dtype=torch.long,
-            device="cuda",
-        )
-        position_ids = position_ids.unsqueeze(0)
-        x, past_key_value = pipelined_inference_layers(
-            model.layers,
-            inputs_embeds,
-            # attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_value=past_key_value,
+        out = model(
+            input_ids,
+            past_key_values=past_key_value,
             output_attentions=output_attentions,
             use_cache=use_cache,
         )
-        x = model.norm(x)
+        x = out.last_hidden_state
+        past_key_value = out.past_key_values
+        # x = model.norm(x)
         logits = model.lm_head(x)
         last_token_logits = logits[:, -1, :]
         print("Final output:", logits[0, 0, :5])
@@ -138,7 +111,6 @@ with torch.no_grad():
         seq_length = 1  # new token
         print(i, timer() - start)
         start = timer()
-        # exit()
 # start = timer()
 # with torch.no_grad():
 #     for i in range(5):

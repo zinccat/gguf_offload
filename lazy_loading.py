@@ -49,58 +49,41 @@ def get_gguf_hf_weights_map(hf_model, model_type=None, num_layers=None, qual_nam
 
 
 def lazy_load_hook(module, inputs):
-    input0 = inputs[0]
-    if isinstance(input0, (tuple, list)):
-        input0 = input0[0]
-
     for attr, hf_key in getattr(module, "lazy_params", {}).items():
         if getattr(module, attr) is not None:
-            continue
+            return
         expert_idx = None
         param = getattr(module, attr)
         if param is None or (hasattr(param, "device") and param.device.type == "meta"):
-            if "experts" in hf_key and "shared_experts" not in hf_key:
-                # Use regex to match the expert index part of the key
-                match = re.search(r"mlp.experts.(\d+)", hf_key)
-                if match:
-                    expert_idx = int(match.group(1))  # Get the expert index
-                    hf_key = re.sub(
-                        r"mlp.experts.(\d+)", "mlp.experts", hf_key
-                    )  # Normalize the key
-                else:
-                    expert_idx = None  # If no expert index is present, set to None
-            hf_key = hf_key.replace(
-                "e_score_correction_bias", "e_score_correction.bias"
-            )
-            if hf_key not in GLOBAL_GGUF_MAPPING:
-                raise ValueError(f"GGUF mapping does not contain key: {hf_key}")
+            if "mlp.experts" in hf_key:
+                expert_idx = int(hf_key.split(".")[4])
+                hf_key = re.sub(r"mlp.experts.\d+.", "mlp.experts.", hf_key)
             else:
-                gguf_tensor, dtype = GLOBAL_GGUF_MAPPING[hf_key]
-            # print(f"Loaded {hf_key} into {attr}")
-            if "weight" not in hf_key or "norm" in hf_key or "gate.weight" in hf_key:
-                # all fp32 weights
-                param_tensor = gguf_tensor.to("cuda", non_blocking=True)
-                if "norm" in hf_key:
-                    param_tensor = param_tensor.half()
-                setattr(module, attr, param_tensor)
+                setattr(module, "lazy_params", {})
+                # remove hook
+                hf_key = hf_key.replace(
+                    "e_score_correction_bias", "e_score_correction.bias"
+                )
+            gguf_tensor, dtype = GLOBAL_GGUF_MAPPING[hf_key]
+            if expert_idx is not None:
+                # print(gguf_tensor[expert_idx].shape, hf_key)
+                # gguf_tensor[expert_idx].pin_memory()
+                setattr(
+                    module,
+                    attr,
+                    gguf_tensor[expert_idx].to("cuda", non_blocking=True),
+                )
             else:
-                if expert_idx is not None:
-                    setattr(
-                        module,
-                        attr,
-                        gguf_tensor[expert_idx].to("cuda", non_blocking=True),
-                    )
-                else:
-                    setattr(module, attr, gguf_tensor.to("cuda", non_blocking=True))
-                setattr(module, "weight_type", int(dtype))
+                setattr(module, attr, gguf_tensor.to("cuda", non_blocking=True))
+            setattr(module, "weight_type", int(dtype))
 
 
 def load_experts(experts, layer_idx, experts_idx):
     keys = ["up_proj.weight", "down_proj.weight", "gate_proj.weight"]
     for key in keys:
         hf_key = f"layers.{layer_idx}.mlp.experts.{key}"
-        if hf_key not in GLOBAL_GGUF_MAPPING:
-            raise ValueError(f"GGUF mapping does not contain key: {hf_key}")
+        # if hf_key not in GLOBAL_GGUF_MAPPING:
+        #     raise ValueError(f"GGUF mapping does not contain key: {hf_key}")
         gguf_tensor, dtype = GLOBAL_GGUF_MAPPING[hf_key]
         # param_tensor = dequantize(
         #     gguf_tensor.data, gguf_tensor.tensor_type, experts_idx
@@ -109,6 +92,27 @@ def load_experts(experts, layer_idx, experts_idx):
         for i, idx in enumerate(experts_idx):
             setattr(experts[idx], key, gguf_tensor[i].to("cuda", non_blocking=True))
             setattr(experts[idx], "weight_type", int(dtype))
+
+def load_single_expert(experts, layer_idx, expert_idx):
+    # torch.Size([2048, 1400]) layers.14.mlp.experts.gate_proj.weight                                                     
+    # torch.Size([2048, 1400]) layers.14.mlp.experts.up_proj.weight                                                       
+    # torch.Size([7168, 528]) layers.14.mlp.experts.down_proj.weight
+    keys = ["gate_proj", "up_proj", "down_proj"]
+    gguf_tensor = []
+    for key in keys:
+        hf_key = f"layers.{layer_idx}.mlp.experts.{key}.weight"
+        tensor, dtype = GLOBAL_GGUF_MAPPING[hf_key]
+        # print(tensor.shape, hf_key)
+        if key == "down_proj":
+            gguf_tensor.append(tensor[expert_idx].reshape(2048, -1))
+        else:
+            gguf_tensor.append(tensor[expert_idx])
+        setattr(getattr(experts[expert_idx], key), "weight_type", int(dtype))
+    gguf_tensor = torch.cat(gguf_tensor, dim=1).to("cuda") #, non_blocking=True)
+    setattr(experts[expert_idx], "gate_proj.weight", gguf_tensor[:, :1400])
+    setattr(experts[expert_idx], "up_proj.weight", gguf_tensor[:, 1400:2800])
+    setattr(experts[expert_idx], "down_proj.weight", gguf_tensor[:, 2800:].reshape(7168, -1))
+    gguf_tensor = None
 
 
 def lazy_offload_hook(module, inputs, output):
@@ -135,7 +139,7 @@ def remove_registered_parameters(model):
         if full_name.split(".")[0] == "layers" and int(full_name.split(".")[1]) < 3:
             # Skip the first 3 Dense layers
             setattr(module, "load_once", True)
-        if (
+        elif (
             "shared_experts" in full_name
             or "mlp.gate" in full_name
             or "norm" in full_name
