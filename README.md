@@ -13,19 +13,22 @@ By performing **dequantization directly on the GPU**, our approach mitigates the
 
 - **Reduced Data Transfer:** The model is stored in a quantized format, which takes up much less space. Only minimal quantized representations are transferred over the PCIe bus.
 - **On-GPU Processing:** Once on the GPU, dequantization is executed in parallel, converting the quantized data into the required full-precision format. This eliminates the need for transferring large, dequantized datasets between the host and GPU.
-- **Improved Throughput:** The combination of asynchronous offloading and pipelining means that data transfers and GPU computations can overlap, further hiding the latency associated with PCIe transfers.
+
+## Dependency
+https://github.com/chu-tianxiang/llama-cpp-torch
+
+`pip install torch huggingface gguf accelerate`
 
 ## Usage
 
-To run the Qwen2 model with minimal GPU memory usage, simply execute:
+To run the DeepSeek V3/R1 model with minimal GPU memory usage, simply execute:
 ```bash
-python lazy_deq.py
+python lazy_deepseek.py
 ```
 This script demonstrates:
 
 - Lazy Loading: Only loads model parts as needed.
 - GPU Dequantization: Converts quantized weights on the GPU.
-- Pipelining: Manages asynchronous offloading to optimize memory and compute resources.
 
 ## Benchmark
 Using batchsize=1, seq_len=512, prefilling
