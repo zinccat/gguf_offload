@@ -17,7 +17,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-""" PyTorch DeepSeek model."""
+"""PyTorch DeepSeek model."""
+
 import math
 import warnings
 from typing import List, Optional, Tuple, Union
@@ -31,8 +32,6 @@ from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.modeling_attn_mask_utils import (
-    AttentionMaskConverter,
-    _prepare_4d_attention_mask,
     _prepare_4d_causal_attention_mask,
 )
 from transformers.modeling_outputs import (
@@ -41,9 +40,7 @@ from transformers.modeling_outputs import (
     SequenceClassifierOutputWithPast,
 )
 from transformers.modeling_utils import PreTrainedModel
-from transformers.pytorch_utils import (
-    ALL_LAYERNORM_LAYERS
-)
+from transformers.pytorch_utils import ALL_LAYERNORM_LAYERS
 from transformers.utils import (
     add_start_docstrings,
     add_start_docstrings_to_model_forward,
@@ -56,6 +53,7 @@ from transformers.utils.import_utils import is_torch_fx_available
 from .configuration_deepseek import DeepseekV3Config
 import torch.distributed as dist
 import register_lib
+from collections import OrderedDict
 
 if is_flash_attn_2_available():
     from flash_attn import flash_attn_func, flash_attn_varlen_func
@@ -87,8 +85,10 @@ def _get_unpad_data(attention_mask):
         max_seqlen_in_batch,
     )
 
+
 class Linear(nn.Module):
     """Quantized linear layer"""
+
     __constants__ = ["in_features", "out_features"]
     in_features: int
     out_features: int
@@ -121,11 +121,17 @@ class Linear(nn.Module):
             output = xshape @ self.weight.view(self.out_features, self.in_features).T
         # Force to use dequant for 2-bit model for now
         elif xshape.shape[0] == 1:
-            output = torch.ops.llama_cpp.ggml_mul_mat_vec_a8(self.weight, xshape, self.weight_type, self.out_features)
+            output = torch.ops.llama_cpp.ggml_mul_mat_vec_a8(
+                self.weight, xshape, self.weight_type, self.out_features
+            )
         elif xshape.shape[0] < 8 and self.weight_type < 16:
-            output = torch.ops.llama_cpp.ggml_mul_mat_a8(self.weight, xshape, self.weight_type, self.out_features)
+            output = torch.ops.llama_cpp.ggml_mul_mat_a8(
+                self.weight, xshape, self.weight_type, self.out_features
+            )
         else:
-            weight = torch.ops.llama_cpp.ggml_dequantize(self.weight, self.weight_type, self.out_features, self.in_features)
+            weight = torch.ops.llama_cpp.ggml_dequantize(
+                self.weight, self.weight_type, self.out_features, self.in_features
+            )
             output = xshape @ weight.T
         if self.bias is not None:
             output = output + self.bias
@@ -148,6 +154,7 @@ class DeepseekV3RMSNorm(nn.Module):
         hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
         # return self.weight * hidden_states.to(input_dtype)
         return (self.weight * hidden_states).to(input_dtype)
+
 
 # from fused_rms_norm import FusedRMSNorm as DeepseekV3RMSNorm
 
@@ -303,7 +310,6 @@ def yarn_linear_ramp_mask(min, max, dim):
 
 
 class DeepseekV3YarnRotaryEmbedding(DeepseekV3RotaryEmbedding):
-
     def __init__(
         self,
         dim,
@@ -468,9 +474,7 @@ class MoEGate(nn.Module):
         ### compute gating score
         hidden_states = hidden_states.view(-1, h)
         # print("Gating weight shape: ", self.weight.shape, self.weight.dtype, hidden_states.shape, hidden_states.dtype)
-        logits = F.linear(
-            hidden_states.type(torch.float32), self.weight, None
-        )
+        logits = F.linear(hidden_states.type(torch.float32), self.weight, None)
         # logits = hidden_states @ self.weight.T
         # logits = torch.ops.llama_cpp.ggml_mul_mat_a8(self.weight, hidden_states, 0, self.n_routed_experts)
         if self.scoring_func == "sigmoid":
@@ -483,15 +487,17 @@ class MoEGate(nn.Module):
         ### select top-k experts
         if self.topk_method == "noaux_tc":
             assert not self.training
-            scores_for_choice = scores.view(bsz * seq_len, -1) + self.e_score_correction_bias.unsqueeze(0)
+            scores_for_choice = scores.view(
+                bsz * seq_len, -1
+            ) + self.e_score_correction_bias.unsqueeze(0)
             group_scores = (
-                scores_for_choice.view(bsz * seq_len, self.n_group, -1).topk(2, dim=-1)[0].sum(dim = -1)
+                scores_for_choice.view(bsz * seq_len, self.n_group, -1)
+                .topk(2, dim=-1)[0]
+                .sum(dim=-1)
             )  # [n, n_group]
             group_idx = torch.topk(
                 group_scores, k=self.topk_group, dim=-1, sorted=False
-            )[
-                1
-            ]  # [n, top_k_group]
+            )[1]  # [n, top_k_group]
             group_mask = torch.zeros_like(group_scores)  # [n, n_group]
             group_mask.scatter_(1, group_idx, 1)  # [n, n_group]
             score_mask = (
@@ -501,10 +507,10 @@ class MoEGate(nn.Module):
                 )
                 .reshape(bsz * seq_len, -1)
             )  # [n, e]
-            tmp_scores = scores_for_choice.masked_fill(~score_mask.bool(), 0.0)  # [n, e]
-            _, topk_idx = torch.topk(
-                tmp_scores, k=self.top_k, dim=-1, sorted=False
-            )
+            tmp_scores = scores_for_choice.masked_fill(
+                ~score_mask.bool(), 0.0
+            )  # [n, e]
+            _, topk_idx = torch.topk(tmp_scores, k=self.top_k, dim=-1, sorted=False)
             topk_weight = scores.gather(1, topk_idx)
         else:
             raise NotImplementedError(
@@ -515,9 +521,32 @@ class MoEGate(nn.Module):
         if self.top_k > 1 and self.norm_topk_prob:
             denominator = topk_weight.sum(dim=-1, keepdim=True) + 1e-20
             topk_weight = topk_weight / denominator
-        topk_weight = topk_weight * self.routed_scaling_factor # must multiply the scaling factor
+        topk_weight = (
+            topk_weight * self.routed_scaling_factor
+        )  # must multiply the scaling factor
 
         return topk_idx, topk_weight
+
+class LRUCache:
+    def __init__(self, max_size: int):
+        self.max_size = max_size
+        self.cache = OrderedDict()
+        self.deleted_elements = []  # Keeps track of all deleted elements
+
+    def add(self, num: int):
+        if num in self.cache:
+            self.cache.move_to_end(num)
+        else:
+            self.cache[num] = None
+
+    def delete(self):
+        to_delete = []
+        while len(self.cache) >= self.max_size:
+            # Get the first element in the cache
+            key, value = self.cache.popitem(last=False)
+            to_delete.append(key)
+        return to_delete
+
 
 class DeepseekV3MoE(nn.Module):
     """
@@ -567,6 +596,8 @@ class DeepseekV3MoE(nn.Module):
                 config=config, intermediate_size=intermediate_size
             )
 
+        self.cache = LRUCache(12)
+
     def forward(self, hidden_states):
         identity = hidden_states
         orig_shape = hidden_states.shape
@@ -587,112 +618,37 @@ class DeepseekV3MoE(nn.Module):
         tokens_per_expert = cnts.sum(dim=0)
         idxs = topk_ids.view(-1).argsort()
         sorted_tokens = x[idxs // topk_ids.shape[1]]
-        # sorted_tokens_shape = sorted_tokens.shape
-        # if self.ep_size > 1:
-        #     tokens_per_ep_rank = tokens_per_expert.view(self.ep_size, -1).sum(dim=1)
-        #     tokens_per_expert_group = tokens_per_expert.new_empty(
-        #         tokens_per_expert.shape[0]
-        #     )
-        #     dist.all_to_all_single(tokens_per_expert_group, tokens_per_expert)
-        #     output_splits = (
-        #         tokens_per_expert_group.view(self.ep_size, -1)
-        #         .sum(1)
-        #         .cpu()
-        #         .numpy()
-        #         .tolist()
-        #     )
-        #     gathered_tokens = sorted_tokens.new_empty(
-        #         tokens_per_expert_group.sum(dim=0).cpu().item(), sorted_tokens.shape[1]
-        #     )
-        #     input_split_sizes = tokens_per_ep_rank.cpu().numpy().tolist()
-        #     dist.all_to_all(
-        #         list(gathered_tokens.split(output_splits)),
-        #         list(sorted_tokens.split(input_split_sizes)),
-        #     )
-        #     tokens_per_expert_post_gather = tokens_per_expert_group.view(
-        #         self.ep_size, self.experts_per_rank
-        #     ).sum(dim=0)
-        #     gatherd_idxs = np.zeros(shape=(gathered_tokens.shape[0],), dtype=np.int32)
-        #     s = 0
-        #     for i, k in enumerate(tokens_per_expert_group.cpu().numpy()):
-        #         gatherd_idxs[s : s + k] = i % self.experts_per_rank
-        #         s += k
-        #     gatherd_idxs = gatherd_idxs.argsort()
-        #     sorted_tokens = gathered_tokens[gatherd_idxs]
-        #     tokens_per_expert = tokens_per_expert_post_gather
-        
-        tokens_per_expert = tokens_per_expert.tolist()
-        # from timeit import default_timer as timer
-        # start = timer()
+
+        tokens_per_expert = tokens_per_expert.tolist()  # important
+
         outputs = []
         start_idx = 0
 
-        # experts_to_use = [i for i in range(len(self.experts)) if tokens_per_expert[i] > 0]
-        # if len(experts_to_use) < 10:
-        #     load_experts(self.experts, self.layer_idx, experts_to_use)
+        expert_to_tokens = []
         for i, num_tokens in enumerate(tokens_per_expert):
             end_idx = start_idx + num_tokens
             if num_tokens == 0:
                 continue
-            expert_out = self.experts[i + self.ep_rank * self.experts_per_rank](sorted_tokens[start_idx:end_idx])
-            outputs.append(expert_out)
+            expert_to_tokens.append((i, sorted_tokens[start_idx:end_idx]))
             start_idx = end_idx
-        
-        outs = torch.cat(outputs, dim=0) if len(outputs) else sorted_tokens.new_empty(0)
 
-        # torch.cuda.synchronize()
-        # print("Time taken: ", timer() - start)
+        outputs = [None] * len(expert_to_tokens)  # Pre-allocate the list
+        use_cache = len(expert_to_tokens) <= 8
+        for idx, (i, tokens) in enumerate(expert_to_tokens):
+            outputs[idx] = self.experts[i](tokens)
+            if not use_cache:
+                self.experts[i].gate_proj.manual_offload()
+                self.experts[i].up_proj.manual_offload()
+                self.experts[i].down_proj.manual_offload()
+        if use_cache:
+            for idx, (i, _) in enumerate(expert_to_tokens):
+                self.cache.add(i)
+            for i in self.cache.delete():
+                self.experts[i].gate_proj.manual_offload()
+                self.experts[i].up_proj.manual_offload()
+                self.experts[i].down_proj.manual_offload()
 
-        # outputs = []
-        # start_idx = 0
-        # streams = []
-
-        # # Create one CUDA stream for each expert
-        # for i, num_tokens in enumerate(tokens_per_expert):
-        #     end_idx = start_idx + num_tokens
-        #     if num_tokens == 0:
-        #         continue
-            
-        #     # Get the expert model
-        #     expert_ = self.experts[i + self.ep_rank * self.experts_per_rank]
-            
-        #     # Select the tokens for this expert
-        #     tokens_for_this_expert = sorted_tokens[start_idx:end_idx]
-        #     # print("Tokens for this expert: ", tokens_for_this_expert.shape)
-            
-        #     # Create a new CUDA stream for asynchronous execution
-        #     stream = torch.cuda.Stream(priority=-i)
-            
-        #     # Asynchronous execution on the given stream
-        #     with torch.cuda.stream(stream):
-        #         expert_out = expert_(tokens_for_this_expert)
-            
-        #     # Append the stream and result pair to outputs to synchronize later
-        #     streams.append(stream)
-        #     outputs.append((expert_out, stream))
-            
-        #     # Update start_idx
-        #     start_idx = end_idx
-
-        # # Now, synchronize all streams to ensure the outputs are ready
-        # final_outputs = []
-        # for output, stream in outputs:
-        #     # Synchronize each stream to ensure the order of operations
-        #     stream.synchronize()
-        #     final_outputs.append(output)  # Move output back to CPU after computation
-
-        # # Concatenate all the outputs while maintaining the order
-        # outs = torch.cat(final_outputs, dim=0) if final_outputs else sorted_tokens.new_empty(0)
-        
-        # if self.ep_size > 1:
-        #     new_x = torch.empty_like(outs)
-        #     new_x[gatherd_idxs] = outs
-        #     gathered_tokens = new_x.new_empty(*sorted_tokens_shape)
-        #     dist.all_to_all(
-        #         list(gathered_tokens.split(input_split_sizes)),
-        #         list(new_x.split(output_splits)),
-        #     )
-        #     outs = gathered_tokens
+        outs = torch.cat(outputs, dim=0)
 
         new_x = torch.empty_like(outs)
         new_x[idxs] = outs
