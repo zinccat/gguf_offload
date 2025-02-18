@@ -2,7 +2,6 @@ import re
 import torch
 from typing import Optional, Tuple
 from gguf import MODEL_ARCH_NAMES, get_tensor_name_map
-from gguf_gpu import dequantize
 
 # Globals to store GGUF state.
 GLOBAL_GGUF_MAPPING = {}
@@ -66,7 +65,6 @@ def lazy_load_hook(module, inputs):
                 )
             gguf_tensor, dtype = GLOBAL_GGUF_MAPPING[hf_key]
             if expert_idx is not None:
-                # print(gguf_tensor[expert_idx].shape, hf_key)
                 # gguf_tensor[expert_idx].pin_memory()
                 setattr(
                     module,
@@ -78,44 +76,29 @@ def lazy_load_hook(module, inputs):
             setattr(module, "weight_type", int(dtype))
 
 
-def load_experts(experts, layer_idx, experts_idx):
-    keys = ["up_proj.weight", "down_proj.weight", "gate_proj.weight"]
-    for key in keys:
-        hf_key = f"layers.{layer_idx}.mlp.experts.{key}"
-        # if hf_key not in GLOBAL_GGUF_MAPPING:
-        #     raise ValueError(f"GGUF mapping does not contain key: {hf_key}")
+def manual_load_hook(module):
+    for attr, hf_key in getattr(module, "lazy_params", {}).items():
+        if getattr(module, attr) is not None:
+            return
+        expert_idx = None
+        splitted = hf_key.split(".")
+        expert_idx = int(splitted[4])
+        hf_key = f"{'.'.join(splitted[:4])}.{'.'.join(splitted[5:])}"
         gguf_tensor, dtype = GLOBAL_GGUF_MAPPING[hf_key]
-        # param_tensor = dequantize(
-        #     gguf_tensor.data, gguf_tensor.tensor_type, experts_idx
-        # )
-        # setattr(experts, key, param_tensor)
-        for i, idx in enumerate(experts_idx):
-            setattr(experts[idx], key, gguf_tensor[i].to("cuda", non_blocking=True))
-            setattr(experts[idx], "weight_type", int(dtype))
-
-def load_single_expert(experts, layer_idx, expert_idx):
-    # torch.Size([2048, 1400]) layers.14.mlp.experts.gate_proj.weight                                                     
-    # torch.Size([2048, 1400]) layers.14.mlp.experts.up_proj.weight                                                       
-    # torch.Size([7168, 528]) layers.14.mlp.experts.down_proj.weight
-    keys = ["gate_proj", "up_proj", "down_proj"]
-    gguf_tensor = []
-    for key in keys:
-        hf_key = f"layers.{layer_idx}.mlp.experts.{key}.weight"
-        tensor, dtype = GLOBAL_GGUF_MAPPING[hf_key]
-        # print(tensor.shape, hf_key)
-        if key == "down_proj":
-            gguf_tensor.append(tensor[expert_idx].reshape(2048, -1))
-        else:
-            gguf_tensor.append(tensor[expert_idx])
-        setattr(getattr(experts[expert_idx], key), "weight_type", int(dtype))
-    gguf_tensor = torch.cat(gguf_tensor, dim=1).to("cuda") #, non_blocking=True)
-    setattr(experts[expert_idx], "gate_proj.weight", gguf_tensor[:, :1400])
-    setattr(experts[expert_idx], "up_proj.weight", gguf_tensor[:, 1400:2800])
-    setattr(experts[expert_idx], "down_proj.weight", gguf_tensor[:, 2800:].reshape(7168, -1))
-    gguf_tensor = None
+        setattr(
+            module,
+            attr,
+            gguf_tensor[expert_idx].to("cuda", non_blocking=True),
+        )
+        setattr(module, "weight_type", int(dtype))
 
 
 def lazy_offload_hook(module, inputs, output):
+    for attr in getattr(module, "lazy_params", {}):
+        setattr(module, attr, None)
+
+
+def manual_offload_hook(module):
     for attr in getattr(module, "lazy_params", {}):
         setattr(module, attr, None)
 
@@ -148,6 +131,9 @@ def remove_registered_parameters(model):
             setattr(module, "load_once", True)
         elif "experts" not in full_name:
             print(f"Lazy loading {full_name}")
+        # elif int(full_name.split(".")[1]) < 5:
+        #     # Skip the first 5 experts
+        #     setattr(module, "load_once", True)
         attr = full_name.split(".")[-1]
         if not hasattr(module, "lazy_params"):
             module.lazy_params = {}
@@ -174,7 +160,18 @@ def load_eager_module_weights(module, full_prefix, device="cuda"):
             # loaded_tensor = dequantize(gguf_tensor.data, gguf_tensor.tensor_type).to(
             #     device, non_blocking=True
             # )
-            loaded_tensor = dequantize(gguf_tensor, dtype).to(device, non_blocking=True)
+            # print(key)
+            if key == "embed_tokens.weight":
+                # print(gguf_tensor.shape, dtype)
+                loaded_tensor = torch.ops.llama_cpp.ggml_dequantize(
+                    gguf_tensor.to(device, non_blocking=True), dtype, 129280, 7168
+                )
+            elif key == "norm.weight":
+                # print(gguf_tensor.shape, dtype)
+                loaded_tensor = gguf_tensor.to(device, non_blocking=True)
+            else:
+                raise ValueError(f"Unknown key: {key}")
+            # loaded_tensor = dequantize(gguf_tensor, dtype).to(device, non_blocking=True)
         # Split the full_name into its components (e.g. "submodule.weight" -> ["submodule", "weight"])
         name_parts = full_name.split(".")
         # Traverse the module hierarchy to get to the correct submodule
