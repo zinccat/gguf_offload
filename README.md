@@ -41,6 +41,8 @@ For Qwen-0.5B
 For DeepSeek-R1 671B 1.58bit quantization
 - gguf_offload: ~14s prefill, ~0.5s decode (bounded by pcie bandwidth, should be around 0.3 on a proper pcie 4.0 machine)
 
+Update: With caching frequently used experts, we can achieve 4-5 token/s!
+
 ## Potential bugs
 Surge GPU memory usage
 
