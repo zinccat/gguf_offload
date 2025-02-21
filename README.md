@@ -15,6 +15,7 @@ By performing **dequantization directly on the GPU**, our approach mitigates the
 - **On-GPU Processing:** Once on the GPU, dequantization is executed in parallel, converting the quantized data into the required full-precision format. This eliminates the need for transferring large, dequantized datasets between the host and GPU.
 
 ## Dependency
+
 https://github.com/Isotr0py/ggml-libtorch
 
 ```bash
@@ -22,7 +23,6 @@ pip install torch huggingface gguf accelerate
 git clone https://github.com/huggingface/transformers
 pip install -e transformers
 ```
-
 
 ## Usage
 
@@ -36,6 +36,7 @@ This script demonstrates:
 - GPU Dequantization: Converts quantized weights on the GPU.
 
 ## Benchmark
+
 Deleted for now due to numerical issues in previous kernel
 
 ## Potential bugs
