@@ -124,10 +124,10 @@ class Linear(nn.Module):
             output = torch.ops.llama_cpp.ggml_mul_mat_vec_a8(
                 self.weight, xshape, self.weight_type, self.out_features
             )
-        elif xshape.shape[0] < 8 and self.weight_type < 16:
-            output = torch.ops.llama_cpp.ggml_mul_mat_a8(
-                self.weight, xshape, self.weight_type, self.out_features
-            )
+        # elif xshape.shape[0] < 8 and self.weight_type < 16:
+        #     output = torch.ops.llama_cpp.ggml_mul_mat_a8(
+        #         self.weight, xshape, self.weight_type, self.out_features
+        #     )
         else:
             weight = torch.ops.llama_cpp.ggml_dequantize(
                 self.weight, self.weight_type, self.out_features, self.in_features
@@ -152,11 +152,9 @@ class DeepseekV3RMSNorm(nn.Module):
         hidden_states = hidden_states.to(torch.float32)
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
         hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-        # return self.weight * hidden_states.to(input_dtype)
         return (self.weight * hidden_states).to(input_dtype)
+        # return self.weight * hidden_states.to(input_dtype)
 
-
-# from fused_rms_norm import FusedRMSNorm as DeepseekV3RMSNorm
 
 ALL_LAYERNORM_LAYERS.append(DeepseekV3RMSNorm)
 
@@ -310,6 +308,7 @@ def yarn_linear_ramp_mask(min, max, dim):
 
 
 class DeepseekV3YarnRotaryEmbedding(DeepseekV3RotaryEmbedding):
+
     def __init__(
         self,
         dim,
@@ -473,10 +472,9 @@ class MoEGate(nn.Module):
         bsz, seq_len, h = hidden_states.shape
         ### compute gating score
         hidden_states = hidden_states.view(-1, h)
-        # print("Gating weight shape: ", self.weight.shape, self.weight.dtype, hidden_states.shape, hidden_states.dtype)
-        logits = F.linear(hidden_states.type(torch.float32), self.weight, None)
-        # logits = hidden_states @ self.weight.T
-        # logits = torch.ops.llama_cpp.ggml_mul_mat_a8(self.weight, hidden_states, 0, self.n_routed_experts)
+        logits = F.linear(
+            hidden_states.type(torch.float32), self.weight.type(torch.float32), None
+        )
         if self.scoring_func == "sigmoid":
             scores = logits.sigmoid()
         else:
@@ -487,17 +485,15 @@ class MoEGate(nn.Module):
         ### select top-k experts
         if self.topk_method == "noaux_tc":
             assert not self.training
-            scores_for_choice = scores.view(
-                bsz * seq_len, -1
-            ) + self.e_score_correction_bias.unsqueeze(0)
+            scores_for_choice = scores.view(bsz * seq_len, -1) + self.e_score_correction_bias.unsqueeze(0)
             group_scores = (
-                scores_for_choice.view(bsz * seq_len, self.n_group, -1)
-                .topk(2, dim=-1)[0]
-                .sum(dim=-1)
+                scores_for_choice.view(bsz * seq_len, self.n_group, -1).topk(2, dim=-1)[0].sum(dim = -1)
             )  # [n, n_group]
             group_idx = torch.topk(
                 group_scores, k=self.topk_group, dim=-1, sorted=False
-            )[1]  # [n, top_k_group]
+            )[
+                1
+            ]  # [n, top_k_group]
             group_mask = torch.zeros_like(group_scores)  # [n, n_group]
             group_mask.scatter_(1, group_idx, 1)  # [n, n_group]
             score_mask = (
@@ -507,10 +503,10 @@ class MoEGate(nn.Module):
                 )
                 .reshape(bsz * seq_len, -1)
             )  # [n, e]
-            tmp_scores = scores_for_choice.masked_fill(
-                ~score_mask.bool(), 0.0
-            )  # [n, e]
-            _, topk_idx = torch.topk(tmp_scores, k=self.top_k, dim=-1, sorted=False)
+            tmp_scores = scores_for_choice.masked_fill(~score_mask.bool(), 0.0)  # [n, e]
+            _, topk_idx = torch.topk(
+                tmp_scores, k=self.top_k, dim=-1, sorted=False
+            )
             topk_weight = scores.gather(1, topk_idx)
         else:
             raise NotImplementedError(
@@ -521,9 +517,7 @@ class MoEGate(nn.Module):
         if self.top_k > 1 and self.norm_topk_prob:
             denominator = topk_weight.sum(dim=-1, keepdim=True) + 1e-20
             topk_weight = topk_weight / denominator
-        topk_weight = (
-            topk_weight * self.routed_scaling_factor
-        )  # must multiply the scaling factor
+        topk_weight = topk_weight * self.routed_scaling_factor # must multiply the scaling factor
 
         return topk_idx, topk_weight
 
@@ -596,7 +590,7 @@ class DeepseekV3MoE(nn.Module):
                 config=config, intermediate_size=intermediate_size
             )
 
-        self.cache = LRUCache(8)
+        self.cache = LRUCache(12)
 
     def forward(self, hidden_states):
         identity = hidden_states
@@ -607,9 +601,8 @@ class DeepseekV3MoE(nn.Module):
         if not self.training:
             y = self.moe_infer(hidden_states, topk_idx, topk_weight).view(*orig_shape)
         if self.config.n_shared_experts is not None:
-            z = self.shared_experts(identity)
-
-        return y + z
+            y = y + self.shared_experts(identity)
+        return y
 
     @torch.no_grad()
     def moe_infer(self, x, topk_ids, topk_weight):
@@ -1705,7 +1698,7 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel, GenerationMixin):
             if isinstance(past_key_values, Cache):
                 cache_length = past_key_values.get_seq_length()
                 past_length = past_key_values.seen_tokens
-                max_cache_length = past_key_values.get_max_length()
+                max_cache_length = past_key_values.get_max_cache_shape()
             else:
                 cache_length = past_length = past_key_values[0][0].shape[2]
                 max_cache_length = None
