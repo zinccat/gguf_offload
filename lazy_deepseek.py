@@ -97,7 +97,6 @@ inputs = tokenizer(prompt, return_tensors="pt").to("cuda")
 generate_ids = model.generate(
     inputs.input_ids,
     streamer=streamer,
-    pad_token_id=tokenizer.eos_token_id,
     max_length=30,
     past_key_values=past_key_value,
 )
