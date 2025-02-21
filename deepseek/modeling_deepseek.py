@@ -590,7 +590,7 @@ class DeepseekV3MoE(nn.Module):
                 config=config, intermediate_size=intermediate_size
             )
 
-        self.cache = LRUCache(12)
+        self.cache = LRUCache(16)
 
     def forward(self, hidden_states):
         identity = hidden_states
@@ -601,8 +601,8 @@ class DeepseekV3MoE(nn.Module):
         if not self.training:
             y = self.moe_infer(hidden_states, topk_idx, topk_weight).view(*orig_shape)
         if self.config.n_shared_experts is not None:
-            y = y + self.shared_experts(identity)
-        return y
+            z = self.shared_experts(identity)
+        return y + z
 
     @torch.no_grad()
     def moe_infer(self, x, topk_ids, topk_weight):
