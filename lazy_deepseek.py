@@ -6,7 +6,7 @@ from transformers.modeling_utils import no_init_weights, init_empty_weights
 from transformers.utils import ContextManagers, logging
 from transformers.cache_utils import DynamicCache
 
-from deepseek.modeling_deepseek import DeepseekV3Model
+from deepseek.modeling_deepseek import DeepseekV3Model, DeepseekV3ForCausalLM
 from gguf import GGUFReader
 import types
 
@@ -41,8 +41,8 @@ config = PretrainedConfig.from_pretrained(pretrained_model_name_or_path)
 config._attn_implementation = "flash_attention_2"
 config.torch_dtype = torch.float16
 with torch.device("meta"):
-    dummy_model = DeepseekV3Model(config)
-tensor_key_mapping = get_gguf_hf_weights_map(dummy_model)
+    dummy_model = DeepseekV3ForCausalLM(config)
+tensor_key_mapping = get_gguf_hf_weights_map(dummy_model.model)
 
 # Load GGUF files and update the global mapping.
 for i in range(1, 4):
@@ -57,7 +57,13 @@ for i in range(1, 4):
     #     GGUFReader.data = np.array(GLOBAL_GGUF_READER.data)
     for tensor in GLOBAL_GGUF_READER.tensors:
         if tensor.name not in tensor_key_mapping:
-            print(tensor.name, tensor.data.shape, "not in mapping")
+            if tensor.name == 'output.weight':
+                GLOBAL_GGUF_MAPPING['lm_head.weight'] = (
+                    torch.from_numpy(tensor.data),
+                    tensor.tensor_type,
+                )
+            else:
+                print(tensor.name, tensor.data.shape, "not in mapping")
             continue
         hf_key = tensor_key_mapping[tensor.name]
         GLOBAL_GGUF_MAPPING[hf_key] = (
@@ -68,11 +74,11 @@ for i in range(1, 4):
 # Initialize the model with empty weights.
 init_contexts = [no_init_weights(_enable=True), init_empty_weights()]
 with ContextManagers(init_contexts):
-    model = DeepseekV3Model(config)
+    model = DeepseekV3ForCausalLM(config)
 
 # Remove parameters to enable lazy loading.
-remove_registered_parameters(model)
-for module in model.modules():
+remove_registered_parameters(model.model)
+for module in model.model.modules():
     if getattr(module, "load_once", False):
         module.register_forward_pre_hook(lazy_load_hook)
     elif hasattr(module, "lazy_params"):
@@ -86,15 +92,16 @@ for module in model.modules():
 model.eval()
 
 # Eagerly load weights for modules that should always remain on GPU.
-load_eager_module_weights(model.embed_tokens, "embed_tokens")
-load_eager_module_weights(model.norm, "norm")
-model.embed_tokens.to("cuda")
-model.norm.to("cuda")
+load_eager_module_weights(model.model.embed_tokens, "embed_tokens")
+load_eager_module_weights(model.model.norm, "norm")
+model.model.embed_tokens.to("cuda")
+model.model.norm.to("cuda")
 
 # use lm_head tied to embed_tokens
-model.lm_head = torch.nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-model.lm_head.weight = model.embed_tokens.weight
-# model.lm_head.to("cuda")
+# model.lm_head = torch.nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+# model.lm_head.weight = model.embed_tokens.weight
+load_eager_module_weights(model.lm_head, "lm_head")
+model.lm_head.to("cuda")
 
 # warmup
 with torch.no_grad():
@@ -109,8 +116,7 @@ with torch.no_grad():
         output_attentions=output_attentions,
         use_cache=use_cache,
     )
-    x = out.last_hidden_state
-    logits = model.lm_head(x)
+    logits = out.logits
 
 torch.cuda.synchronize()
 
@@ -133,10 +139,8 @@ with torch.no_grad():
         if flag:
             flag = False
             st = timer()
-        x = out.last_hidden_state
+        logits = out.logits
         past_key_value = out.past_key_values
-        # x = model.norm(x)
-        logits = model.lm_head(x)
         last_token_logits = logits[:, -1, :]
         print("Final output:", logits[0, 0, :5])
         input_ids = torch.argmax(last_token_logits, dim=-1, keepdim=True)
@@ -159,10 +163,7 @@ with torch.no_grad():
         if flag:
             flag = False
             st = timer()
-        x = out.last_hidden_state
-        # past_key_value = out.past_key_values
-        # x = model.norm(x)
-        logits = model.lm_head(x)
+        logits = out.logits
         print(
             f"Finished {i + 1} inference, GPU memory: {torch.cuda.memory_allocated() / 1e9:.2f} GB, time: {timer() - start:.2f}"
         )

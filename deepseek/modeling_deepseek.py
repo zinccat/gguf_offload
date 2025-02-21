@@ -39,7 +39,7 @@ from transformers.modeling_outputs import (
     CausalLMOutputWithPast,
     SequenceClassifierOutputWithPast,
 )
-from transformers.modeling_utils import PreTrainedModel
+from transformers.modeling_utils import PreTrainedModel, GenerationMixin
 from transformers.pytorch_utils import ALL_LAYERNORM_LAYERS
 from transformers.utils import (
     add_start_docstrings,
@@ -596,7 +596,7 @@ class DeepseekV3MoE(nn.Module):
                 config=config, intermediate_size=intermediate_size
             )
 
-        self.cache = LRUCache(12)
+        self.cache = LRUCache(8)
 
     def forward(self, hidden_states):
         identity = hidden_states
@@ -1565,7 +1565,7 @@ class DeepseekV3Model(DeepseekV3PreTrainedModel):
         )
 
 
-class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel):
+class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel, GenerationMixin):
     _tied_weights_keys = ["lm_head.weight"]
 
     def __init__(self, config):

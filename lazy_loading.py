@@ -169,6 +169,10 @@ def load_eager_module_weights(module, full_prefix, device="cuda"):
             elif key == "norm.weight":
                 # print(gguf_tensor.shape, dtype)
                 loaded_tensor = gguf_tensor.to(device, non_blocking=True)
+            elif key == "lm_head.weight":
+                loaded_tensor = torch.ops.llama_cpp.ggml_dequantize(
+                    gguf_tensor.to(device, non_blocking=True), dtype, 7168, 129280
+                )
             else:
                 raise ValueError(f"Unknown key: {key}")
             # loaded_tensor = dequantize(gguf_tensor, dtype).to(device, non_blocking=True)
