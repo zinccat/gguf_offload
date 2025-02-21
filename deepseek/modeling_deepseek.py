@@ -117,10 +117,10 @@ class Linear(nn.Module):
 
     def forward(self, x):
         xshape = x.view(-1, x.shape[-1])
-        if self.weight_type < 2:
-            output = xshape @ self.weight.view(self.out_features, self.in_features).T
+        # if self.weight_type < 2:
+        #     output = xshape @ self.weight.view(self.out_features, self.in_features).T
         # Force to use dequant for 2-bit model for now
-        elif xshape.shape[0] == 1:
+        if xshape.shape[0] == 1:
             output = torch.ops.llama_cpp.ggml_mul_mat_vec_a8(
                 self.weight, xshape, self.weight_type, self.out_features
             )
@@ -624,11 +624,9 @@ class DeepseekV3MoE(nn.Module):
                 continue
             expert_to_tokens.append((i, sorted_tokens[start_idx:end_idx]))
             start_idx = end_idx
-
-        outputs = [None] * len(expert_to_tokens)  # Pre-allocate the list
         use_cache = len(expert_to_tokens) <= 8
         for idx, (i, tokens) in enumerate(expert_to_tokens):
-            outputs[idx] = self.experts[i](tokens)
+            outputs.append(self.experts[i](tokens))
             if not use_cache:
                 self.experts[i].gate_proj.manual_offload()
                 self.experts[i].up_proj.manual_offload()
@@ -1565,7 +1563,7 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel, GenerationMixin):
         super().__init__(config)
         self.model = DeepseekV3Model(config)
         self.vocab_size = config.vocab_size
-        self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -1697,7 +1695,7 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel, GenerationMixin):
         if past_key_values is not None:
             if isinstance(past_key_values, Cache):
                 cache_length = past_key_values.get_seq_length()
-                past_length = past_key_values.seen_tokens
+                past_length = kwargs.get("cache_position")[0]
                 max_cache_length = past_key_values.get_max_cache_shape()
             else:
                 cache_length = past_length = past_key_values[0][0].shape[2]
