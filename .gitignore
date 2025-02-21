@@ -4,6 +4,10 @@ ignore/
 quantmul/
 *.nsys-rep
 *.sqlite
+*.out
+*.txt*
+*.gguf
+.vscode/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

@@ -15,9 +15,14 @@ By performing **dequantization directly on the GPU**, our approach mitigates the
 - **On-GPU Processing:** Once on the GPU, dequantization is executed in parallel, converting the quantized data into the required full-precision format. This eliminates the need for transferring large, dequantized datasets between the host and GPU.
 
 ## Dependency
-https://github.com/chu-tianxiang/llama-cpp-torch
 
-`pip install torch huggingface gguf accelerate`
+https://github.com/Isotr0py/ggml-libtorch
+
+```bash
+pip install torch huggingface gguf accelerate
+git clone https://github.com/huggingface/transformers
+pip install -e transformers
+```
 
 ## Usage
 
@@ -31,17 +36,8 @@ This script demonstrates:
 - GPU Dequantization: Converts quantized weights on the GPU.
 
 ## Benchmark
-Using batchsize=1, seq_len=512, prefilling
 
-For Qwen-0.5B
-- Full GPU inference: 0.030s (2348 MiB)
-- gguf_offload: 0.075s (1086 MiB)
-- sequential offload using `accelerate`: 0.293s
-
-For DeepSeek-R1 671B 1.58bit quantization
-- gguf_offload: ~14s prefill, ~0.5s decode (bounded by pcie bandwidth, should be around 0.3 on a proper pcie 4.0 machine)
-
-Update: With caching frequently used experts, we can achieve 4-5 token/s!
+Deleted for now due to numerical issues in previous kernel
 
 ## Potential bugs
 Surge GPU memory usage
