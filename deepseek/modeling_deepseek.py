@@ -837,7 +837,7 @@ class DeepseekV3Attention(nn.Module):
             torch.Tensor: Output tensor with the same shape as the input.
         """
         bsz, seqlen, _ = hidden_states.size()
-        start_pos = cache_position[0] if use_cache else 0
+        start_pos = cache_position[0][0] if use_cache else 0
         end_pos = start_pos + seqlen
         q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states)))
         q = q.view(bsz, seqlen, self.num_heads, self.q_head_dim)
@@ -846,9 +846,7 @@ class DeepseekV3Attention(nn.Module):
         kv = self.kv_a_proj_with_mqa(hidden_states)
         kv, k_pe = torch.split(kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         cos, sin = self.rotary_emb.forward_fp16(seq_len=end_pos)
-        q_pe, k_pe = apply_rotary_pos_emb(q_pe.transpose(1, 2), k_pe.unsqueeze(2).transpose(1, 2), cos, sin, cache_position.unsqueeze(0))
-        q_pe = q_pe.transpose(1, 2)
-        k_pe = k_pe.transpose(1, 2)
+        q_pe, k_pe = apply_rotary_pos_emb(q_pe, k_pe.unsqueeze(2), cos, sin, cache_position, 2)
         if self.attn_impl == "naive":
             q = torch.cat([q_nope, q_pe], dim=-1)
             kv = self.kv_b_proj(self.kv_a_layernorm(kv))
@@ -874,7 +872,7 @@ class DeepseekV3Attention(nn.Module):
             scores = (torch.einsum("bshc,btc->bsht", q_nope, self.kv_cache[:bsz, :end_pos]) +
                       torch.einsum("bshr,btr->bsht", q_pe, self.pe_cache[:bsz, :end_pos])) * self.softmax_scale
         if attention_mask is not None:
-            scores += attention_mask.transpose(1, 2)
+            scores += attention_mask
         scores = scores.softmax(dim=-1, dtype=torch.float32).type_as(hidden_states)
         if self.attn_impl == "naive":
             x = torch.einsum("bsht,bthd->bshd", scores, self.v_cache[:bsz, :end_pos])
@@ -1434,6 +1432,7 @@ class DeepseekV3Model(DeepseekV3PreTrainedModel):
             else self.config.output_hidden_states
         )
         use_cache = use_cache if use_cache is not None else self.config.use_cache
+        cache_position = cache_position.unsqueeze(0)
 
         return_dict = (
             return_dict if return_dict is not None else self.config.use_return_dict
@@ -1486,6 +1485,7 @@ class DeepseekV3Model(DeepseekV3PreTrainedModel):
                 inputs_embeds,
                 past_key_values_length,
             )
+            attention_mask = attention_mask.transpose(1, 2)
 
         # embed positions
         hidden_states = inputs_embeds

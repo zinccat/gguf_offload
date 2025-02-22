@@ -80,17 +80,29 @@ def manual_load_hook(module):
     for attr, hf_key in getattr(module, "lazy_params", {}).items():
         if getattr(module, attr) is not None:
             return
-        expert_idx = None
-        splitted = hf_key.split(".")
-        expert_idx = int(splitted[4])
-        hf_key = f"{'.'.join(splitted[:4])}.{'.'.join(splitted[5:])}"
-        gguf_tensor, dtype = GLOBAL_GGUF_MAPPING[hf_key]
-        setattr(
-            module,
-            attr,
-            gguf_tensor[expert_idx].to("cuda", non_blocking=True),
-        )
-        setattr(module, "weight_type", int(dtype))
+        param = getattr(module, attr)
+        if param is None or (hasattr(param, "device") and param.device.type == "meta"):
+            expert_idx = None
+            if "mlp.experts" in hf_key:
+                splitted = hf_key.split(".")
+                expert_idx = int(splitted[4])
+                hf_key = f"{'.'.join(splitted[:4])}.{'.'.join(splitted[5:])}"
+            else:
+                setattr(module, "lazy_params", {})
+                # remove hook
+                hf_key = hf_key.replace(
+                    "e_score_correction_bias", "e_score_correction.bias"
+                )
+            gguf_tensor, dtype = GLOBAL_GGUF_MAPPING[hf_key]
+            if expert_idx is not None:
+                setattr(
+                    module,
+                    attr,
+                    gguf_tensor[expert_idx].to("cuda", non_blocking=True),
+                )
+            else:
+                setattr(module, attr, gguf_tensor.to("cuda", non_blocking=True))
+            setattr(module, "weight_type", int(dtype))
 
 
 def lazy_offload_hook(module, inputs, output):
