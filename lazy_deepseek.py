@@ -4,7 +4,6 @@ from timeit import default_timer as timer
 from transformers import PretrainedConfig, AutoTokenizer, TextStreamer
 from transformers.modeling_utils import no_init_weights, init_empty_weights
 from transformers.utils import ContextManagers
-from transformers.cache_utils import DynamicCache
 
 from deepseek.modeling_deepseek import DeepseekV3ForCausalLM
 from gguf import GGUFReader
@@ -28,7 +27,7 @@ torch.set_default_dtype(torch.float16)
 # Load model configuration and create a dummy model (on "meta") for weight mapping.
 pretrained_model_name_or_path = "deepseek-ai/DeepSeek-R1"
 config = PretrainedConfig.from_pretrained(pretrained_model_name_or_path)
-config._attn_implementation = "flash_attention_2"
+config.head_dim = 192
 config.torch_dtype = torch.float16
 with torch.device("meta"):
     dummy_model = DeepseekV3ForCausalLM(config)
@@ -68,7 +67,7 @@ with ContextManagers(init_contexts):
 remove_registered_parameters(model.model)
 for module in model.model.modules():
     if getattr(module, "load_once", False):
-        module.register_forward_pre_hook(lazy_load_hook)
+        manual_load_hook(module)
     elif hasattr(module, "lazy_params"):
         module.register_forward_pre_hook(lazy_load_hook)
         # module.register_forward_hook(lazy_offload_hook)
@@ -93,8 +92,6 @@ generate_ids = model.generate(
     streamer=streamer,
     pad_token_id=tokenizer.eos_token_id,
     max_length=50,
-    # cache_implementation="static"
-    # past_key_values=past_key_value,
 )
 print(generate_ids)
 print(len(inputs.input_ids[0]), len(generate_ids[0]))

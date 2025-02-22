@@ -201,6 +201,8 @@ class DeepseekV3Config(PretrainedConfig):
         self.attention_bias = attention_bias
         self.attention_dropout = attention_dropout
 
+        self.head_dim = 192
+
         super().__init__(
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,
