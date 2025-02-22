@@ -48,6 +48,7 @@ def get_gguf_hf_weights_map(hf_model, model_type=None, num_layers=None, qual_nam
 
 
 def lazy_load_hook(module, inputs):
+    device = inputs[0].device
     for attr, hf_key in getattr(module, "lazy_params", {}).items():
         if getattr(module, attr) is not None:
             return
@@ -69,14 +70,14 @@ def lazy_load_hook(module, inputs):
                 setattr(
                     module,
                     attr,
-                    gguf_tensor[expert_idx].to("cuda", non_blocking=True),
+                    gguf_tensor[expert_idx].to(device, non_blocking=True),
                 )
             else:
-                setattr(module, attr, gguf_tensor.to("cuda", non_blocking=True))
+                setattr(module, attr, gguf_tensor.to(device, non_blocking=True))
             setattr(module, "weight_type", int(dtype))
 
 
-def manual_load_hook(module):
+def manual_load_hook(module, device="cuda"):
     for attr, hf_key in getattr(module, "lazy_params", {}).items():
         if getattr(module, attr) is not None:
             return
@@ -98,10 +99,10 @@ def manual_load_hook(module):
                 setattr(
                     module,
                     attr,
-                    gguf_tensor[expert_idx].to("cuda", non_blocking=True),
+                    gguf_tensor[expert_idx].to(device, non_blocking=True),
                 )
             else:
-                setattr(module, attr, gguf_tensor.to("cuda", non_blocking=True))
+                setattr(module, attr, gguf_tensor.to(device, non_blocking=True))
             setattr(module, "weight_type", int(dtype))
 
 
