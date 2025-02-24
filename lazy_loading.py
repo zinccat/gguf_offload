@@ -48,15 +48,46 @@ def get_gguf_hf_weights_map(hf_model, model_type=None, num_layers=None, qual_nam
 
 
 def lazy_load_hook(module, inputs):
+    device = inputs[0].device
+    for attr, hf_key in getattr(module, "lazy_params", {}).items():
+        param = getattr(module, attr)
+        if param is not None:
+            return
+        else:
+            expert_idx = None
+            if "mlp.experts" in hf_key:
+                splitted = hf_key.split(".")
+                expert_idx = int(splitted[4])
+                hf_key = f"{'.'.join(splitted[:4])}.{'.'.join(splitted[5:])}"
+            else:
+                setattr(module, "lazy_params", {})
+                # remove hook
+                hf_key = hf_key.replace(
+                    "e_score_correction_bias", "e_score_correction.bias"
+                )
+            gguf_tensor, dtype = GLOBAL_GGUF_MAPPING[hf_key]
+            setattr(module, "weight_type", int(dtype))
+            if expert_idx is not None:
+                setattr(
+                    module,
+                    attr,
+                    gguf_tensor[expert_idx].to(device, non_blocking=True),
+                )
+            else:
+                setattr(module, attr, gguf_tensor.to(device, non_blocking=True))
+
+
+def manual_load_hook(module, device="cuda"):
     for attr, hf_key in getattr(module, "lazy_params", {}).items():
         if getattr(module, attr) is not None:
             return
-        expert_idx = None
         param = getattr(module, attr)
         if param is None or (hasattr(param, "device") and param.device.type == "meta"):
+            expert_idx = None
             if "mlp.experts" in hf_key:
-                expert_idx = int(hf_key.split(".")[4])
-                hf_key = re.sub(r"mlp.experts.\d+.", "mlp.experts.", hf_key)
+                splitted = hf_key.split(".")
+                expert_idx = int(splitted[4])
+                hf_key = f"{'.'.join(splitted[:4])}.{'.'.join(splitted[5:])}"
             else:
                 setattr(module, "lazy_params", {})
                 # remove hook
@@ -65,32 +96,14 @@ def lazy_load_hook(module, inputs):
                 )
             gguf_tensor, dtype = GLOBAL_GGUF_MAPPING[hf_key]
             if expert_idx is not None:
-                # gguf_tensor[expert_idx].pin_memory()
                 setattr(
                     module,
                     attr,
-                    gguf_tensor[expert_idx].to("cuda", non_blocking=True),
+                    gguf_tensor[expert_idx].to(device, non_blocking=True),
                 )
             else:
-                setattr(module, attr, gguf_tensor.to("cuda", non_blocking=True))
+                setattr(module, attr, gguf_tensor.to(device, non_blocking=True))
             setattr(module, "weight_type", int(dtype))
-
-
-def manual_load_hook(module):
-    for attr, hf_key in getattr(module, "lazy_params", {}).items():
-        if getattr(module, attr) is not None:
-            return
-        expert_idx = None
-        splitted = hf_key.split(".")
-        expert_idx = int(splitted[4])
-        hf_key = f"{'.'.join(splitted[:4])}.{'.'.join(splitted[5:])}"
-        gguf_tensor, dtype = GLOBAL_GGUF_MAPPING[hf_key]
-        setattr(
-            module,
-            attr,
-            gguf_tensor[expert_idx].to("cuda", non_blocking=True),
-        )
-        setattr(module, "weight_type", int(dtype))
 
 
 def lazy_offload_hook(module, inputs, output):
@@ -171,7 +184,7 @@ def load_eager_module_weights(module, full_prefix, device="cuda"):
                 loaded_tensor = gguf_tensor.to(device, non_blocking=True)
             elif key == "lm_head.weight":
                 loaded_tensor = torch.ops.llama_cpp.ggml_dequantize(
-                    gguf_tensor.to(device, non_blocking=True), dtype, 7168, 129280
+                    gguf_tensor.to(device, non_blocking=True), dtype, 129280, 7168
                 )
             else:
                 raise ValueError(f"Unknown key: {key}")
@@ -186,6 +199,7 @@ def load_eager_module_weights(module, full_prefix, device="cuda"):
         param_name = name_parts[-1]
         # Replace (or register) the parameter in the found submodule
         submodule.register_parameter(param_name, torch.nn.Parameter(loaded_tensor))
+    module.to(device)
 
 
 def pipelined_inference_layers(

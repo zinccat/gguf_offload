@@ -535,7 +535,7 @@ class LRUCache:
 
     def delete(self):
         to_delete = []
-        while len(self.cache) >= self.max_size:
+        while len(self.cache) > self.max_size:
             # Get the first element in the cache
             key, value = self.cache.popitem(last=False)
             to_delete.append(key)
@@ -589,8 +589,15 @@ class DeepseekV3MoE(nn.Module):
             self.shared_experts = DeepseekV3MLP(
                 config=config, intermediate_size=intermediate_size
             )
-
-        self.cache = LRUCache(16)
+        # if layer_idx < 40:
+        #     self.cache = LRUCache(44)
+        # else:
+        #     self.cache = LRUCache(100) #) #16)
+        # if layer_idx < 50:
+        #     self.cache = LRUCache(32)
+        # else:
+        #     self.cache = LRUCache(256) #) #16)
+        self.cache = LRUCache(16) #4)
 
     def forward(self, hidden_states):
         identity = hidden_states
@@ -617,31 +624,48 @@ class DeepseekV3MoE(nn.Module):
         outputs = []
         start_idx = 0
 
+        # from timeit import default_timer as timer
+        # start = timer()
+
         expert_to_tokens = []
         for i, num_tokens in enumerate(tokens_per_expert):
-            end_idx = start_idx + num_tokens
-            if num_tokens == 0:
-                continue
-            expert_to_tokens.append((i, sorted_tokens[start_idx:end_idx]))
-            start_idx = end_idx
-
-        outputs = [None] * len(expert_to_tokens)  # Pre-allocate the list
+            if num_tokens:
+                expert_to_tokens.append((i, sorted_tokens[start_idx:start_idx + num_tokens]))
+            start_idx += num_tokens
         use_cache = len(expert_to_tokens) <= 8
-        for idx, (i, tokens) in enumerate(expert_to_tokens):
-            outputs[idx] = self.experts[i](tokens)
-            if not use_cache:
-                self.experts[i].gate_proj.manual_offload()
-                self.experts[i].up_proj.manual_offload()
-                self.experts[i].down_proj.manual_offload()
-        if use_cache:
-            for idx, (i, _) in enumerate(expert_to_tokens):
+        # for i, tokens in expert_to_tokens:
+        #     expert = self.experts[i]
+        #     outputs.append(expert(tokens))
+        #     if not use_cache:
+        #         expert.gate_proj.manual_offload()
+        #         expert.up_proj.manual_offload()
+        #         expert.down_proj.manual_offload()
+        if not use_cache:
+            for i, tokens in expert_to_tokens:
+                expert = self.experts[i]
+                outputs.append(expert(tokens))
+                expert.gate_proj.manual_offload()
+                expert.up_proj.manual_offload()
+                expert.down_proj.manual_offload()
+        else:
+            # experts = [self.experts[i] for i, _ in expert_to_tokens]
+            # tokens = [tokens for _, tokens in expert_to_tokens]
+            # outputs = torch.nn.parallel.parallel_apply(
+            #     experts, tokens
+            # )
+            for i, tokens in expert_to_tokens:
+                expert = self.experts[i]
+                outputs.append(expert(tokens))
+            for i, _ in expert_to_tokens:
                 self.cache.add(i)
             for i in self.cache.delete():
-                self.experts[i].gate_proj.manual_offload()
-                self.experts[i].up_proj.manual_offload()
-                self.experts[i].down_proj.manual_offload()
+                expert = self.experts[i]
+                expert.gate_proj.manual_offload()
+                expert.up_proj.manual_offload()
+                expert.down_proj.manual_offload()
 
         outs = torch.cat(outputs, dim=0)
+        # print("Time taken: ", timer() - start)
 
         new_x = torch.empty_like(outs)
         new_x[idxs] = outs
@@ -741,6 +765,20 @@ class DeepseekV3Attention(nn.Module):
                 mscale = yarn_get_mscale(scaling_factor, mscale_all_dim)
                 self.softmax_scale = self.softmax_scale * mscale * mscale
 
+        self.attn_impl = "mla"
+        self.max_batch_size = 1
+        self.max_seq_len = 1024 #200 #50
+
+        if self.attn_impl == "naive":
+            self.register_buffer("k_cache", torch.zeros(self.max_batch_size, self.max_seq_len, self.num_heads, self.q_head_dim), persistent=False)
+            self.register_buffer("v_cache", torch.zeros(self.max_batch_size, self.max_seq_len, self.num_heads, self.v_head_dim), persistent=False)
+        else:
+            self.register_buffer("kv_cache", torch.zeros(self.max_batch_size, self.max_seq_len, self.kv_lora_rank), persistent=False)
+            self.register_buffer("pe_cache", torch.zeros(self.max_batch_size, self.max_seq_len, self.qk_rope_head_dim), persistent=False)
+
+        self.wkv_b = None
+
+
     def _init_rope(self):
         if self.config.rope_scaling is None:
             self.rotary_emb = DeepseekV3RotaryEmbedding(
@@ -793,7 +831,7 @@ class DeepseekV3Attention(nn.Module):
             .transpose(1, 2)
             .contiguous()
         )
-
+    
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -802,105 +840,68 @@ class DeepseekV3Attention(nn.Module):
         past_key_value: Optional[Cache] = None,
         output_attentions: bool = False,
         use_cache: bool = False,
+        cache_position: Optional[torch.LongTensor] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-        if "padding_mask" in kwargs:
-            warnings.warn(
-                "Passing `padding_mask` is deprecated and will be removed in v4.37. Please make sure use `attention_mask` instead.`"
-            )
-        bsz, q_len, _ = hidden_states.size()
+        """
+        Forward pass for the Multi-Headed Attention Layer (MLA).
 
-        if self.q_lora_rank is None:
-            q = self.q_proj(hidden_states)
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, seq_len, dim).
+            start_pos (int): Starting position in the sequence for caching.
+            freqs_cis (torch.Tensor): Precomputed complex exponential values for rotary embeddings.
+            mask (Optional[torch.Tensor]): Mask tensor to exclude certain positions from attention.
+
+        Returns:
+            torch.Tensor: Output tensor with the same shape as the input.
+        """
+        bsz, seqlen, _ = hidden_states.size()
+        start_pos = cache_position[0][0] if use_cache else 0
+        end_pos = start_pos + seqlen
+        q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states)))
+        q = q.view(bsz, seqlen, self.num_heads, self.q_head_dim)
+        q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+        
+        kv = self.kv_a_proj_with_mqa(hidden_states)
+        kv, k_pe = torch.split(kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+        cos, sin = self.rotary_emb.forward(q_pe, seq_len=end_pos)
+        q_pe, k_pe = apply_rotary_pos_emb(q_pe, k_pe.unsqueeze(2), cos, sin, cache_position, 2)
+        if self.attn_impl == "naive":
+            q = torch.cat([q_nope, q_pe], dim=-1)
+            kv = self.kv_b_proj(self.kv_a_layernorm(kv))
+            kv = kv.view(bsz, seqlen, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
+            k_nope, v = torch.split(kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+            k = torch.cat([k_nope, k_pe.expand(-1, -1, self.num_heads, -1)], dim=-1)
+            self.k_cache[:bsz, start_pos:end_pos] = k
+            self.v_cache[:bsz, start_pos:end_pos] = v
+            if self.k_cache.device != hidden_states.device:
+                self.k_cache = self.k_cache.to(hidden_states)
+                self.v_cache = self.v_cache.to(hidden_states)
+            scores = torch.einsum("bshd,bthd->bsht", q, self.k_cache[:bsz, :end_pos]) * self.softmax_scale
         else:
-            q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states)))
-        q = q.view(bsz, q_len, self.num_heads, self.q_head_dim).transpose(1, 2)
-        q_nope, q_pe = torch.split(
-            q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
-        )
-
-        compressed_kv = self.kv_a_proj_with_mqa(hidden_states)
-        compressed_kv, k_pe = torch.split(
-            compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
-        )
-        k_pe = k_pe.view(bsz, q_len, 1, self.qk_rope_head_dim).transpose(1, 2)
-        kv = (
-            self.kv_b_proj(self.kv_a_layernorm(compressed_kv))
-            .view(bsz, q_len, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
-            .transpose(1, 2)
-        )
-
-        k_nope, value_states = torch.split(
-            kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1
-        )
-        kv_seq_len = value_states.shape[-2]
-        if past_key_value is not None:
-            if self.layer_idx is None:
-                raise ValueError(
-                    f"The cache structure has changed since version v4.36. If you are using {self.__class__.__name__} "
-                    "for auto-regressive decoding with k/v caching, please make sure to initialize the attention class "
-                    "with a layer index."
-                )
-            kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
-        cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
-
-        q_pe, k_pe = apply_rotary_pos_emb(q_pe, k_pe, cos, sin, position_ids)
-
-        query_states = k_pe.new_empty(bsz, self.num_heads, q_len, self.q_head_dim)
-        query_states[:, :, :, : self.qk_nope_head_dim] = q_nope
-        query_states[:, :, :, self.qk_nope_head_dim :] = q_pe
-
-        key_states = k_pe.new_empty(bsz, self.num_heads, q_len, self.q_head_dim)
-        key_states[:, :, :, : self.qk_nope_head_dim] = k_nope
-        key_states[:, :, :, self.qk_nope_head_dim :] = k_pe
-        if past_key_value is not None:
-            cache_kwargs = {"sin": sin, "cos": cos}  # Specific to RoPE models
-            key_states, value_states = past_key_value.update(
-                key_states, value_states, self.layer_idx, cache_kwargs
-            )
-
-        attn_weights = (
-            torch.matmul(query_states, key_states.transpose(2, 3)) * self.softmax_scale
-        )
-
-        if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
-            raise ValueError(
-                f"Attention weights should be of size {(bsz, self.num_heads, q_len, kv_seq_len)}, but is"
-                f" {attn_weights.size()}"
-            )
-        assert attention_mask is not None
+            if self.kv_cache.device != hidden_states.device:
+                self.kv_cache = self.kv_cache.to(hidden_states)
+                self.pe_cache = self.pe_cache.to(hidden_states)
+            if self.wkv_b is None:
+                self.wkv_b = torch.ops.llama_cpp.ggml_dequantize(
+                    self.kv_b_proj.weight, self.kv_b_proj.weight_type, 32768, 512)
+                self.wkv_b = self.wkv_b.view(self.num_heads, -1, self.kv_lora_rank)
+                self.kv_b_proj.weight = None
+            q_nope = torch.einsum("bshd,hdc->bshc", q_nope, self.wkv_b[:, :self.qk_nope_head_dim])
+            self.kv_cache[:bsz, start_pos:end_pos] = self.kv_a_layernorm(kv)
+            self.pe_cache[:bsz, start_pos:end_pos] = k_pe.squeeze(2)
+            scores = (torch.einsum("bshc,btc->bsht", q_nope, self.kv_cache[:bsz, :end_pos]) +
+                      torch.einsum("bshr,btr->bsht", q_pe, self.pe_cache[:bsz, :end_pos])) * self.softmax_scale
         if attention_mask is not None:
-            if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
-                raise ValueError(
-                    f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
-                )
-            attn_weights = attn_weights + attention_mask
-
-        # upcast attention to fp32
-        attn_weights = nn.functional.softmax(
-            attn_weights, dim=-1, dtype=torch.float32
-        ).to(query_states.dtype)
-        attn_weights = nn.functional.dropout(
-            attn_weights, p=self.attention_dropout, training=self.training
-        )
-        attn_output = torch.matmul(attn_weights, value_states)
-
-        if attn_output.size() != (bsz, self.num_heads, q_len, self.v_head_dim):
-            raise ValueError(
-                f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.v_head_dim)}, but is"
-                f" {attn_output.size()}"
-            )
-
-        attn_output = attn_output.transpose(1, 2).contiguous()
-
-        attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.v_head_dim)
-
-        attn_output = self.o_proj(attn_output)
-
-        if not output_attentions:
-            attn_weights = None
-
-        return attn_output, attn_weights, past_key_value
+            scores.add_(attention_mask)
+        scores = scores.softmax(dim=-1, dtype=torch.float32).type_as(hidden_states)
+        if self.attn_impl == "naive":
+            x = torch.einsum("bsht,bthd->bshd", scores, self.v_cache[:bsz, :end_pos])
+        else:
+            x = torch.einsum("bsht,btc->bshc", scores, self.kv_cache[:bsz, :end_pos])
+            x = torch.einsum("bshc,hdc->bshd", x, self.wkv_b[:, -self.v_head_dim:])
+        x = self.o_proj(x.flatten(2))
+        return x, None, None
 
 
 # Copied from transformers.models.llama.modeling_llama.LlamaFlashAttention2 with Llama->DeepseekV3
@@ -1219,6 +1220,7 @@ class DeepseekV3DecoderLayer(nn.Module):
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
+        cache_position: Optional[torch.LongTensor] = None,
         **kwargs,
     ) -> Tuple[
         torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]
@@ -1253,6 +1255,7 @@ class DeepseekV3DecoderLayer(nn.Module):
             past_key_value=past_key_value,
             output_attentions=output_attentions,
             use_cache=use_cache,
+            cache_position=cache_position,
             **kwargs,
         )
         hidden_states = residual + hidden_states
@@ -1437,6 +1440,7 @@ class DeepseekV3Model(DeepseekV3PreTrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        cache_position: Optional[torch.LongTensor] = None,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         output_attentions = (
             output_attentions
@@ -1449,6 +1453,7 @@ class DeepseekV3Model(DeepseekV3PreTrainedModel):
             else self.config.output_hidden_states
         )
         use_cache = use_cache if use_cache is not None else self.config.use_cache
+        cache_position = cache_position.unsqueeze(0)
 
         return_dict = (
             return_dict if return_dict is not None else self.config.use_return_dict
@@ -1501,6 +1506,7 @@ class DeepseekV3Model(DeepseekV3PreTrainedModel):
                 inputs_embeds,
                 past_key_values_length,
             )
+            attention_mask = attention_mask.transpose(1, 2)
 
         # embed positions
         hidden_states = inputs_embeds
@@ -1510,10 +1516,13 @@ class DeepseekV3Model(DeepseekV3PreTrainedModel):
         all_self_attns = () if output_attentions else None
         next_decoder_cache = None
 
-        for decoder_layer in self.layers:
+        for idx, decoder_layer in enumerate(self.layers):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
-
+            # if idx == 40: #28:
+            #     hidden_states = hidden_states.to('cuda:1')
+            #     attention_mask = attention_mask.to('cuda:1')
+            #     cache_position = cache_position.to('cuda:1')
             layer_outputs = decoder_layer(
                 hidden_states,
                 attention_mask=attention_mask,
@@ -1521,6 +1530,7 @@ class DeepseekV3Model(DeepseekV3PreTrainedModel):
                 past_key_value=past_key_values,
                 output_attentions=output_attentions,
                 use_cache=use_cache,
+                cache_position=cache_position,
             )
 
             hidden_states = layer_outputs[0]
@@ -1565,7 +1575,7 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel, GenerationMixin):
         super().__init__(config)
         self.model = DeepseekV3Model(config)
         self.vocab_size = config.vocab_size
-        self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -1604,6 +1614,7 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel, GenerationMixin):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        cache_position: Optional[torch.LongTensor] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         r"""
         Args:
@@ -1652,6 +1663,7 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel, GenerationMixin):
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
+            cache_position=cache_position,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
@@ -1697,7 +1709,7 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel, GenerationMixin):
         if past_key_values is not None:
             if isinstance(past_key_values, Cache):
                 cache_length = past_key_values.get_seq_length()
-                past_length = past_key_values.seen_tokens
+                past_length = kwargs.get("cache_position")[0]
                 max_cache_length = past_key_values.get_max_cache_shape()
             else:
                 cache_length = past_length = past_key_values[0][0].shape[2]
@@ -1746,6 +1758,7 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel, GenerationMixin):
                 "past_key_values": past_key_values,
                 "use_cache": kwargs.get("use_cache"),
                 "attention_mask": attention_mask,
+                "cache_position": kwargs.get("cache_position"),
             }
         )
         return model_inputs

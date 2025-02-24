@@ -4,7 +4,6 @@ from timeit import default_timer as timer
 from transformers import PretrainedConfig, AutoTokenizer, TextStreamer
 from transformers.modeling_utils import no_init_weights, init_empty_weights
 from transformers.utils import ContextManagers
-from transformers.cache_utils import DynamicCache
 
 from deepseek.modeling_deepseek import DeepseekV3ForCausalLM
 from gguf import GGUFReader
@@ -22,14 +21,14 @@ from lazy_loading import (
 )
 
 torch.manual_seed(0)
-torch.set_default_dtype(torch.bfloat16)
+torch.set_default_dtype(torch.float16)
 # torch.cuda.set_per_process_memory_fraction(0.4)
 
 # Load model configuration and create a dummy model (on "meta") for weight mapping.
 pretrained_model_name_or_path = "deepseek-ai/DeepSeek-R1"
 config = PretrainedConfig.from_pretrained(pretrained_model_name_or_path)
-config._attn_implementation = "flash_attention_2"
-config.torch_dtype = torch.bfloat16
+config.head_dim = 192
+config.torch_dtype = torch.float16
 with torch.device("meta"):
     dummy_model = DeepseekV3ForCausalLM(config)
 tensor_key_mapping = get_gguf_hf_weights_map(dummy_model.model)
@@ -43,8 +42,6 @@ for i in range(1, 4):
     #     # DeepSeek-R1-Q4_K_M-00009-of-00009.gguf
     #     gguf_path = f"../DeepSeek-R1-GGUF/DeepSeek-R1-Q4_K_M/DeepSeek-R1-Q4_K_M-0000{i}-of-00009.gguf"
     GLOBAL_GGUF_READER = GGUFReader(gguf_path)
-    # if i == 1:
-    #     GGUFReader.data = np.array(GLOBAL_GGUF_READER.data)
     for tensor in GLOBAL_GGUF_READER.tensors:
         if tensor.name not in tensor_key_mapping:
             if tensor.name == "output.weight":
@@ -70,7 +67,7 @@ with ContextManagers(init_contexts):
 remove_registered_parameters(model.model)
 for module in model.model.modules():
     if getattr(module, "load_once", False):
-        module.register_forward_pre_hook(lazy_load_hook)
+        manual_load_hook(module)
     elif hasattr(module, "lazy_params"):
         module.register_forward_pre_hook(lazy_load_hook)
         # module.register_forward_hook(lazy_offload_hook)
@@ -83,22 +80,18 @@ model.eval()
 load_eager_module_weights(model.model.embed_tokens, "embed_tokens")
 load_eager_module_weights(model.model.norm, "norm")
 load_eager_module_weights(model.lm_head, "lm_head")
-model.model.embed_tokens.to("cuda")
-model.model.norm.to("cuda")
-model.lm_head.to("cuda")
 
 tokenizer = AutoTokenizer.from_pretrained(pretrained_model_name_or_path)
 
 st = timer()
 prompt = "<｜User｜>1+1等于几<｜Assistant｜>"
 streamer = TextStreamer(tokenizer)
-past_key_value = DynamicCache()
 inputs = tokenizer(prompt, return_tensors="pt").to("cuda")
 generate_ids = model.generate(
     inputs.input_ids,
     streamer=streamer,
-    max_length=30,
-    past_key_values=past_key_value,
+    pad_token_id=tokenizer.eos_token_id,
+    max_length=50,
 )
 print(generate_ids)
 print(len(inputs.input_ids[0]), len(generate_ids[0]))
