@@ -2,7 +2,6 @@
 
 import torch
 import ggml_cuda
-import llamacpp_cuda
 
 import torch._custom_ops
 from torch import Tensor

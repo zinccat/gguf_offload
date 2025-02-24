@@ -117,10 +117,10 @@ class Linear(nn.Module):
 
     def forward(self, x):
         xshape = x.view(-1, x.shape[-1])
-        # if self.weight_type < 2:
-        #     output = xshape @ self.weight.view(self.out_features, self.in_features).T
+        if self.weight_type < 2:
+            output = xshape @ self.weight.view(self.out_features, self.in_features).T
         # Force to use dequant for 2-bit model for now
-        if xshape.shape[0] == 1:
+        elif xshape.shape[0] == 1:
             output = torch.ops.llama_cpp.ggml_mul_mat_vec_a8(
                 self.weight, xshape, self.weight_type, self.out_features
             )
@@ -199,15 +199,6 @@ class DeepseekV3RotaryEmbedding(nn.Module):
         return (
             self.cos_cached[:seq_len].to(dtype=x.dtype),
             self.sin_cached[:seq_len].to(dtype=x.dtype),
-        )
-    
-    def forward_fp16(self, seq_len=None):
-        if self.max_seq_len_cached is None or seq_len > self.max_seq_len_cached:
-            self._set_cos_sin_cache(seq_len=seq_len, device="cuda", dtype=torch.float16)
-
-        return (
-            self.cos_cached[:seq_len],
-            self.sin_cached[:seq_len]
         )
 
 
@@ -544,7 +535,7 @@ class LRUCache:
 
     def delete(self):
         to_delete = []
-        while len(self.cache) >= self.max_size:
+        while len(self.cache) > self.max_size:
             # Get the first element in the cache
             key, value = self.cache.popitem(last=False)
             to_delete.append(key)
@@ -598,8 +589,15 @@ class DeepseekV3MoE(nn.Module):
             self.shared_experts = DeepseekV3MLP(
                 config=config, intermediate_size=intermediate_size
             )
-
-        self.cache = LRUCache(16)
+        # if layer_idx < 40:
+        #     self.cache = LRUCache(44)
+        # else:
+        #     self.cache = LRUCache(100) #) #16)
+        # if layer_idx < 50:
+        #     self.cache = LRUCache(32)
+        # else:
+        #     self.cache = LRUCache(256) #) #16)
+        self.cache = LRUCache(16) #4)
 
     def forward(self, hidden_states):
         identity = hidden_states
@@ -626,29 +624,48 @@ class DeepseekV3MoE(nn.Module):
         outputs = []
         start_idx = 0
 
+        # from timeit import default_timer as timer
+        # start = timer()
+
         expert_to_tokens = []
         for i, num_tokens in enumerate(tokens_per_expert):
-            end_idx = start_idx + num_tokens
-            if num_tokens == 0:
-                continue
-            expert_to_tokens.append((i, sorted_tokens[start_idx:end_idx]))
-            start_idx = end_idx
+            if num_tokens:
+                expert_to_tokens.append((i, sorted_tokens[start_idx:start_idx + num_tokens]))
+            start_idx += num_tokens
         use_cache = len(expert_to_tokens) <= 8
-        for idx, (i, tokens) in enumerate(expert_to_tokens):
-            outputs.append(self.experts[i](tokens))
-            if not use_cache:
-                self.experts[i].gate_proj.manual_offload()
-                self.experts[i].up_proj.manual_offload()
-                self.experts[i].down_proj.manual_offload()
-        if use_cache:
-            for idx, (i, _) in enumerate(expert_to_tokens):
+        # for i, tokens in expert_to_tokens:
+        #     expert = self.experts[i]
+        #     outputs.append(expert(tokens))
+        #     if not use_cache:
+        #         expert.gate_proj.manual_offload()
+        #         expert.up_proj.manual_offload()
+        #         expert.down_proj.manual_offload()
+        if not use_cache:
+            for i, tokens in expert_to_tokens:
+                expert = self.experts[i]
+                outputs.append(expert(tokens))
+                expert.gate_proj.manual_offload()
+                expert.up_proj.manual_offload()
+                expert.down_proj.manual_offload()
+        else:
+            # experts = [self.experts[i] for i, _ in expert_to_tokens]
+            # tokens = [tokens for _, tokens in expert_to_tokens]
+            # outputs = torch.nn.parallel.parallel_apply(
+            #     experts, tokens
+            # )
+            for i, tokens in expert_to_tokens:
+                expert = self.experts[i]
+                outputs.append(expert(tokens))
+            for i, _ in expert_to_tokens:
                 self.cache.add(i)
             for i in self.cache.delete():
-                self.experts[i].gate_proj.manual_offload()
-                self.experts[i].up_proj.manual_offload()
-                self.experts[i].down_proj.manual_offload()
+                expert = self.experts[i]
+                expert.gate_proj.manual_offload()
+                expert.up_proj.manual_offload()
+                expert.down_proj.manual_offload()
 
         outs = torch.cat(outputs, dim=0)
+        # print("Time taken: ", timer() - start)
 
         new_x = torch.empty_like(outs)
         new_x[idxs] = outs
@@ -750,7 +767,7 @@ class DeepseekV3Attention(nn.Module):
 
         self.attn_impl = "mla"
         self.max_batch_size = 1
-        self.max_seq_len = 50
+        self.max_seq_len = 1024 #200 #50
 
         if self.attn_impl == "naive":
             self.register_buffer("k_cache", torch.zeros(self.max_batch_size, self.max_seq_len, self.num_heads, self.q_head_dim), persistent=False)
@@ -758,6 +775,8 @@ class DeepseekV3Attention(nn.Module):
         else:
             self.register_buffer("kv_cache", torch.zeros(self.max_batch_size, self.max_seq_len, self.kv_lora_rank), persistent=False)
             self.register_buffer("pe_cache", torch.zeros(self.max_batch_size, self.max_seq_len, self.qk_rope_head_dim), persistent=False)
+
+        self.wkv_b = None
 
 
     def _init_rope(self):
@@ -845,7 +864,7 @@ class DeepseekV3Attention(nn.Module):
         
         kv = self.kv_a_proj_with_mqa(hidden_states)
         kv, k_pe = torch.split(kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-        cos, sin = self.rotary_emb.forward_fp16(seq_len=end_pos)
+        cos, sin = self.rotary_emb.forward(q_pe, seq_len=end_pos)
         q_pe, k_pe = apply_rotary_pos_emb(q_pe, k_pe.unsqueeze(2), cos, sin, cache_position, 2)
         if self.attn_impl == "naive":
             q = torch.cat([q_nope, q_pe], dim=-1)
@@ -863,22 +882,24 @@ class DeepseekV3Attention(nn.Module):
             if self.kv_cache.device != hidden_states.device:
                 self.kv_cache = self.kv_cache.to(hidden_states)
                 self.pe_cache = self.pe_cache.to(hidden_states)
-            wkv_b = torch.ops.llama_cpp.ggml_dequantize(
-                self.kv_b_proj.weight, self.kv_b_proj.weight_type, 32768, 512)
-            wkv_b = wkv_b.view(self.num_heads, -1, self.kv_lora_rank)
-            q_nope = torch.einsum("bshd,hdc->bshc", q_nope, wkv_b[:, :self.qk_nope_head_dim])
+            if self.wkv_b is None:
+                self.wkv_b = torch.ops.llama_cpp.ggml_dequantize(
+                    self.kv_b_proj.weight, self.kv_b_proj.weight_type, 32768, 512)
+                self.wkv_b = self.wkv_b.view(self.num_heads, -1, self.kv_lora_rank)
+                self.kv_b_proj.weight = None
+            q_nope = torch.einsum("bshd,hdc->bshc", q_nope, self.wkv_b[:, :self.qk_nope_head_dim])
             self.kv_cache[:bsz, start_pos:end_pos] = self.kv_a_layernorm(kv)
             self.pe_cache[:bsz, start_pos:end_pos] = k_pe.squeeze(2)
             scores = (torch.einsum("bshc,btc->bsht", q_nope, self.kv_cache[:bsz, :end_pos]) +
                       torch.einsum("bshr,btr->bsht", q_pe, self.pe_cache[:bsz, :end_pos])) * self.softmax_scale
         if attention_mask is not None:
-            scores += attention_mask
+            scores.add_(attention_mask)
         scores = scores.softmax(dim=-1, dtype=torch.float32).type_as(hidden_states)
         if self.attn_impl == "naive":
             x = torch.einsum("bsht,bthd->bshd", scores, self.v_cache[:bsz, :end_pos])
         else:
             x = torch.einsum("bsht,btc->bshc", scores, self.kv_cache[:bsz, :end_pos])
-            x = torch.einsum("bshc,hdc->bshd", x, wkv_b[:, -self.v_head_dim:])
+            x = torch.einsum("bshc,hdc->bshd", x, self.wkv_b[:, -self.v_head_dim:])
         x = self.o_proj(x.flatten(2))
         return x, None, None
 
@@ -1495,10 +1516,13 @@ class DeepseekV3Model(DeepseekV3PreTrainedModel):
         all_self_attns = () if output_attentions else None
         next_decoder_cache = None
 
-        for decoder_layer in self.layers:
+        for idx, decoder_layer in enumerate(self.layers):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
-
+            # if idx == 40: #28:
+            #     hidden_states = hidden_states.to('cuda:1')
+            #     attention_mask = attention_mask.to('cuda:1')
+            #     cache_position = cache_position.to('cuda:1')
             layer_outputs = decoder_layer(
                 hidden_states,
                 attention_mask=attention_mask,

@@ -50,10 +50,10 @@ def get_gguf_hf_weights_map(hf_model, model_type=None, num_layers=None, qual_nam
 def lazy_load_hook(module, inputs):
     device = inputs[0].device
     for attr, hf_key in getattr(module, "lazy_params", {}).items():
-        if getattr(module, attr) is not None:
-            return
         param = getattr(module, attr)
-        if param is None or (hasattr(param, "device") and param.device.type == "meta"):
+        if param is not None:
+            return
+        else:
             expert_idx = None
             if "mlp.experts" in hf_key:
                 splitted = hf_key.split(".")
@@ -66,6 +66,7 @@ def lazy_load_hook(module, inputs):
                     "e_score_correction_bias", "e_score_correction.bias"
                 )
             gguf_tensor, dtype = GLOBAL_GGUF_MAPPING[hf_key]
+            setattr(module, "weight_type", int(dtype))
             if expert_idx is not None:
                 setattr(
                     module,
@@ -74,7 +75,6 @@ def lazy_load_hook(module, inputs):
                 )
             else:
                 setattr(module, attr, gguf_tensor.to(device, non_blocking=True))
-            setattr(module, "weight_type", int(dtype))
 
 
 def manual_load_hook(module, device="cuda"):
